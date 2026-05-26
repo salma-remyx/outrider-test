@@ -1,0 +1,104 @@
+name: 'Remyx Recommendation'
+description: 'Open a draft PR with the next arXiv paper to integrate. Remyx ranks papers against your team''s research interest; Claude Code drafts the implementation scaffold.'
+branding:
+  icon: 'book-open'
+  color: 'purple'
+
+inputs:
+  interest-id:
+    description: |
+      Remyx ResearchInterest UUID. Get it from engine.remyx.ai → your
+      interest's detail page → "Workflow snippet" tab.
+    required: true
+  min-confidence:
+    description: |
+      Tier gate. Recommendations below this confidence are skipped.
+      One of: "high" | "moderate" | "low". Default: moderate.
+    required: false
+    default: 'moderate'
+  draft-mode:
+    description: |
+      PR-draft policy:
+        - "always":          every PR opens as draft (default; future
+                             Modal-eval webhook will flip to ready)
+        - "on_test_failure": tests pass → ready, tests fail → draft
+        - "never":           tests pass → ready, tests fail → skip
+    required: false
+    default: 'always'
+  rate-limit-days:
+    description: |
+      Skip the run if a previous Remyx Recommendation PR was opened
+      within this many days. Default 7 (weekly cadence). Set to 0 to
+      disable the rate limit and rely only on per-paper dedup.
+    required: false
+    default: '7'
+  guardrails-allowlist:
+    description: |
+      Comma-separated extra path globs Claude Code may touch on top of
+      the defaults ({package}/*_integration.py, tests/test_*.py,
+      .remyx-recommendation/**, README.md). Most repos won't need this.
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: |
+      Run outcome: "pr_opened" | "pr_opened_draft" | "issue_opened" |
+      "skipped_low_confidence" | "skipped_rate_limit" | "skipped_pr_exists" |
+      "skipped_test_failure" | "claude_failed" | "rejected_path_violations" |
+      "error".
+    value: ${{ steps.recommend.outputs.status }}
+  pr_url:
+    description: 'URL of the opened PR (set when status starts with "pr_opened").'
+    value: ${{ steps.recommend.outputs.pr_url }}
+  issue_url:
+    description: 'URL of the opened Issue (set when status == "issue_opened").'
+    value: ${{ steps.recommend.outputs.issue_url }}
+  arxiv:
+    description: 'arxiv_id of the recommended paper.'
+    value: ${{ steps.recommend.outputs.arxiv }}
+  tier:
+    description: 'Confidence tier of the recommendation (high / moderate / low / noise).'
+    value: ${{ steps.recommend.outputs.tier }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up Node (for Claude Code CLI)
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Claude Code CLI
+      shell: bash
+      run: |
+        npm install -g @anthropic-ai/claude-code
+        claude --version
+
+    - name: Install pytest (orchestrator runs target's tests as part of validation)
+      shell: bash
+      run: pip install pytest
+
+    - name: Configure git identity
+      shell: bash
+      run: |
+        git config --global user.name "Remyx Recommendation"
+        git config --global user.email "remyx-recommendation@noreply.remyx.ai"
+
+    - name: Recommend + implement + open PR
+      id: recommend
+      shell: bash
+      env:
+        TARGET_REPO: ${{ github.repository }}
+        INPUT_INTEREST_ID: ${{ inputs.interest-id }}
+        INPUT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
+        INPUT_DRAFT_MODE: ${{ inputs.draft-mode }}
+        INPUT_RATE_LIMIT_DAYS: ${{ inputs.rate-limit-days }}
+        INPUT_GUARDRAILS_ALLOWLIST: ${{ inputs.guardrails-allowlist }}
+      run: |
+        python ${{ github.action_path }}/src/run.py
