@@ -37,6 +37,14 @@ In your repo's **Settings → Secrets and variables → Actions**, add:
 | `REMYX_API_KEY` | the key from step 2 |
 | `ANTHROPIC_API_KEY` | your Anthropic key from [console.anthropic.com](https://console.anthropic.com) — used to invoke Claude Code |
 
+### 3b. Allow Actions to open pull requests
+
+In **Settings → Actions → General → Workflow permissions**, enable:
+
+> ☑ Allow GitHub Actions to create and approve pull requests
+
+This is disabled by default at the org level for new repos. Without it, the action runs to completion but the final PR-creation step returns `HTTP 403: GitHub Actions is not permitted to create or approve pull requests`. The setting can be enabled per-repo without changing org defaults.
+
 ### 4. Add the workflow
 
 Create `.github/workflows/remyx-recommendation.yml`:
