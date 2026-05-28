@@ -1,6 +1,6 @@
 # Remyx Recommendation — GitHub Action
 
-A composite GitHub Action that, on a schedule you choose, picks the next arXiv paper for your team to integrate (via the Remyx engine API) and opens a draft pull request with a scaffolded implementation written by Claude Code.
+A composite GitHub Action that, on a schedule you choose, picks the next arXiv paper for your team to integrate (via the Remyx engine API) and either opens a draft pull request that wires the paper's contribution into an existing call site in your codebase, or opens a discussion Issue when the paper doesn't fit.
 
 ```yaml
 - uses: remyxai/remyx-recommendation-action@v1
@@ -14,9 +14,11 @@ Each scheduled run:
 
 1. Queries `engine.remyx.ai` for the top-ranked paper against your team's configured `ResearchInterest` (Remyx already knows your repo's commit history and codifies what your team has been building).
 2. Either:
-   - Opens a **draft pull request** in your repo with a scaffolded integration module, matching tests, and a README append, OR
-   - Opens an **Issue** with the paper's details and a discussion of what would block a clean integration — when Claude Code determines the paper can't be cleanly scaffolded against your existing code.
+   - Opens a **draft pull request** that adds a small capability-named module AND wires it into an existing call site in your package, with a self-review section in the PR body honestly noting what was implemented vs. left out, OR
+   - Opens an **Issue** with the paper's details and a discussion of what would block a clean integration — when the paper doesn't fit (pre-flight, validators, or self-review route it to discussion instead of a PR).
 3. Reports outputs (`status`, `pr_url`, `issue_url`, `arxiv`, `tier`) you can chain into downstream steps.
+
+The orchestrator defaults to opening Issues, not PRs. A PR is only opened when the implementation wires new code into an existing module, passes a stub-density check, has at least one test that imports from a pre-existing module, and survives a self-review pass over the diff. This makes PRs ready-to-ship rather than scaffold-shaped.
 
 ## Setup (5 minutes)
 
@@ -97,7 +99,7 @@ Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflo
 |---|---|---|
 | `status` | always | Run outcome (see status table below) |
 | `pr_url` | when status starts with `pr_opened` | URL of the opened PR |
-| `issue_url` | when `status == issue_opened` | URL of the opened Issue (paper couldn't be cleanly scaffolded) |
+| `issue_url` | when status starts with `issue_opened` | URL of the opened Issue |
 | `arxiv` | when a recommendation was fetched | arxiv_id of the picked paper |
 | `tier` | when a recommendation was fetched | Confidence tier (`high` / `moderate` / `low` / `noise`) |
 
@@ -107,7 +109,12 @@ Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflo
 |---|---|
 | `pr_opened` | PR opened ready-for-review (tests passed, `draft-mode != always`) |
 | `pr_opened_draft` | PR opened as draft (the default under `draft-mode: always`, or when tests failed under `draft-mode: on_test_failure`) |
-| `issue_opened` | Claude couldn't cleanly scaffold against your code; an Issue was opened with the paper + a discussion of what would block integration |
+| `issue_opened_preflight` | Pre-flight Claude pass routed to Issue **before** spending the implementation budget (paper needs infra the repo lacks, or no clear call site) |
+| `issue_opened` | Claude elected Issue-mode during implementation (wrote `OPEN_AS_ISSUE.md` instead of code) |
+| `issue_opened_no_integration` | New module(s) added but no existing file was modified to wire them in — orphan scaffold detected |
+| `issue_opened_stub_density` | New module's public surface is dominated by `pass` / `raise NotImplementedError` / empty bodies (≥50% of function bodies are stubs) |
+| `issue_opened_no_test_integration` | New tests only self-test the new file; no new test imports from a pre-existing module |
+| `issue_opened_self_review` | Second Claude pass over the diff concluded the changes are deletable with no functional loss |
 | `skipped_low_confidence` | Recommendation below `min-confidence` |
 | `skipped_rate_limit` | A previous Remyx PR was opened within `rate-limit-days` |
 | `skipped_pr_exists` | An open PR for this exact paper already exists |
@@ -119,14 +126,18 @@ Visit your repo's **Actions** tab → **Remyx Recommendation** → **Run workflo
 ## Guardrails — what Claude can and can't modify
 
 Allowed paths (defaults):
-- `<package>/*_integration.py` — new integration modules
-- `tests/test_*.py` — new test files
+- `<package>/**/*.py` — any module in your target package (new or existing, so Claude can add the wiring edit at the call site)
+- `tests/**/*.py` — any test file
 - `.remyx-recommendation/**` — the spec bundle (scrubbed before commit, never lands in the PR)
 - `README.md` — append-only attribution section
 
 Always blocked:
 - `.github/**`, `docker/**`, `pipelines/**`, `config/**`
 - `requirements.txt`, `setup.py`, `pyproject.toml`, `MANIFEST.in`
+
+Edit-size caps (post-hoc, enforced after the Claude session):
+- Each edit to a pre-existing file is capped at **50 net lines** (additions + deletions). Larger edits get rejected — wiring is expected to be surgical.
+- At most **3 new `.py` files** under the target package per run.
 
 If Claude touches anything outside the allowed set, the action rejects the run and does not open a PR. Use the `guardrails-allowlist` input to extend the allowed set for your repo.
 
@@ -144,13 +155,28 @@ Clone repo, branch from main
        ↓
 Write .remyx-recommendation/ spec bundle (briefing for Claude)
        ↓
-Invoke claude --dangerously-skip-permissions
-       ↓
-Either: open OPEN_AS_ISSUE.md (→ Issue mode) or write integration code
-       ↓
-Path-allowlist check + pytest
-       ↓
-Commit (with bundle scrubbed) + push + open draft PR
+Pre-flight Claude pass: PR or Issue?
+       ↓                              ↓
+     ISSUE                            PR
+       ↓                              ↓
+   open Issue        Invoke claude --dangerously-skip-permissions
+                                      ↓
+                     Either: open OPEN_AS_ISSUE.md (→ Issue mode)
+                     or implement INTEGRATION (call-site edit + new module)
+                                      ↓
+                     Path-allowlist check  +  integration validator
+                     (new module must be imported by a modified file)
+                                      ↓
+                     Stub-density check (new module not mostly TODOs)
+                                      ↓
+                     pytest  +  test-integration check
+                     (≥1 new test must import a pre-existing module)
+                                      ↓
+                     Self-review pass over the diff
+                     (PR body gets "What this PR actually does" section;
+                      downgrade to Issue if diff is deletable with no loss)
+                                      ↓
+                     Commit (with bundle scrubbed) + push + open draft PR
 ```
 
 The recommendation engine (commit-history extraction, candidate pool, embedding pre-filter, Gemini ranking) lives server-side on engine.remyx.ai. This action is a pure consumer; the API call returns a fully-formed recommendation with reasoning + suggested experiment + interest context body.
@@ -159,10 +185,10 @@ The recommendation engine (commit-history extraction, candidate pool, embedding 
 
 Per run:
 - Remyx API: included in your engine.remyx.ai subscription
-- Claude Code: ~$0.30-0.50 per draft-PR run (you bring your own `ANTHROPIC_API_KEY`)
+- Claude Code: ~$0.40-0.70 per draft-PR run (you bring your own `ANTHROPIC_API_KEY`) — the pre-flight + implementation + self-review passes together. Runs routed to Issue at pre-flight skip the implementation pass and cost less.
 - GitHub Actions minutes: ~5 minutes per run on `ubuntu-latest`
 
-At weekly cadence (~4 runs/mo) with ~50% confidence-gate skip rate, expect ~$1-2/mo Claude + a handful of free-tier Actions minutes.
+At weekly cadence (~4 runs/mo) with ~50% confidence-gate skip rate, expect ~$1-3/mo Claude + a handful of free-tier Actions minutes.
 
 ## License
 

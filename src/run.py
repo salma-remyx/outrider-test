@@ -43,6 +43,7 @@ GITHUB_TOKEN are passed through unchanged.
 """
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import json
 import logging
@@ -81,13 +82,35 @@ TIER_RANK = {"high": 3, "moderate": 2, "low": 1, "noise": 0, "near-random": 0}
 
 # Paths Claude Code is allowed to create/modify. Customers can extend
 # via the `guardrails-allowlist` input on the action (comma-separated).
+#
+# Permissive on the target package because §2 of the "ready-to-ship PRs"
+# work requires the agent to be able to add small wiring edits to
+# existing files (e.g. a 3-line hook in evaluation.py). The post-hoc
+# check_integration() validator caps how much can change per existing
+# file and rejects runs that only add freestanding modules.
 DEFAULT_ALLOWLIST_GLOBS = [
-    "{package}/*_integration.py",
-    "tests/test_*_integration.py",
-    "tests/test_*.py",
+    "{package}/*.py",
+    "{package}/**/*.py",
+    "tests/**/*.py",
     ".remyx-recommendation/**",
     "README.md",
 ]
+
+# Cap on additions+deletions per pre-existing file. Keeps wiring edits
+# small and surgical; rejects runs where Claude rewrote an unrelated
+# module under the cover of "integration".
+MAX_LINES_PER_EXISTING_FILE = 50
+
+# Cap on number of newly-created .py files in the target package. A
+# real integration adds one module, sometimes two; anything beyond
+# that is scaffold-shaped.
+MAX_NEW_PACKAGE_FILES = 3
+
+# Stub density (fraction of function bodies that are pass / ellipsis /
+# raise NotImplementedError / docstring-only) above which we route to
+# Issue instead of opening a PR. At this density the paper's actual
+# contribution isn't really present in the diff.
+STUB_DENSITY_DOWNGRADE_THRESHOLD = 0.5
 
 BUNDLE_DIR_NAME = ".remyx-recommendation"
 BRANCH_PREFIX = "remyx-recommendation/"
@@ -201,27 +224,35 @@ Read these files in order:
   4. .remyx-recommendation/GUARDRAILS.md — what you may and may not modify
 
 Then look at the existing codebase structure (especially the `{package}/`
-package and `tests/` directory) to understand the project's conventions
-and what actually exists to integrate against.
+package and `tests/` directory) to understand the project's conventions,
+the existing call sites, and what actually exists to integrate against.
 
 # Step 1 — decide: PR or Issue
 
-After reading the brief AND inspecting the relevant existing code, decide
-whether you can produce a *concrete*, *non-vacuous* scaffold. Open as
-ISSUE (not PR) if any of these is true:
+DEFAULT: open an Issue. PR is the exception, not the rule.
+
+Open as PR only if BOTH of these hold:
+
+  (a) You can identify a SPECIFIC existing module/function in `{package}/`
+      where this paper's contribution slots in (the "call site").
+
+  (b) The paper's PRIMARY contribution can be implemented end-to-end
+      here, OR the integration produces a USEFUL SIGNAL on real
+      pipeline output without the paper's neural/checkpoint components
+      (e.g. a quality filter, a scorer, an evaluation hook).
+
+Open as Issue if any of these is true:
 
   - The paper's contribution requires infrastructure the codebase lacks
-    (e.g. a trainer when the repo is inference-only, a dataset format
-    the repo never touches).
-  - The integration point is too vague to pick a real module / API —
-    you'd be inventing the integration rather than slotting into one.
-  - The paper requires specific external checkpoints, datasets, or
-    services the team clearly doesn't have access to, AND the scaffold
-    couldn't usefully exist without them.
-  - You searched the codebase for the relevant entry points and found
-    nothing reasonable to extend or call into.
+    (a trainer when the repo is inference-only, a dataset format the
+    repo never touches, external checkpoints with no path to load).
+  - You cannot point at a specific existing call site to modify.
+  - Your implementation would be a freestanding module that no existing
+    code imports or calls — i.e. it could be deleted without breaking
+    or altering anything in the repo.
+  - You'd be inventing the integration rather than slotting into one.
 
-If ANY of the above hold, DO NOT WRITE CODE. Instead, write a file at
+If ANY of those hold, DO NOT WRITE CODE. Write a file at
 `{issue_fallback_filename}` with this exact shape (Markdown):
 
 ```
@@ -234,8 +265,8 @@ Optional one-line subtitle.
 
 ## What blocks a clean implementation
 
-(Specifics: missing infra, vague integration point, required external
-artifacts, etc. Be concrete about what would need to exist for a real
+(Specifics: missing infra, no clear call site, required external
+artifacts. Be concrete about what would need to exist for a real
 integration to be drafted.)
 
 ## What we'd need to know / decide first
@@ -244,58 +275,169 @@ integration to be drafted.)
 implementable.)
 ```
 
-The orchestrator detects this file and opens a GitHub Issue instead of a
-draft PR. No code is committed, no PR is opened, no time is wasted on
-scaffolding that would mislead a reviewer.
+The orchestrator detects this file and opens an Issue instead of a PR.
+This is the HONEST outcome when the paper doesn't fit, not a failure.
 
-# Step 2 — only if you DIDN'T write the issue file: implement
+# Step 2 — only if you're proceeding with PR: implement an INTEGRATION
 
-Implement the MINIMAL-VIABLE-SCAFFOLDING version of the spec:
+The goal is the smallest change that calls into existing code with
+paper-derived behavior. NOT a scaffold. NOT a freestanding module.
 
-- Create one new module under `{package}/` (likely `{package}/<paper_slug>_integration.py`)
-  with:
-    * A config dataclass (e.g. `<Paper>Config`) holding the paper's reported
-      hyperparameters as defaults
-    * A class scaffold for the integration entry point. Keep heavy lifting
-      (external checkpoint loading, etc.) as documented TODOs so this PR
-      doesn't pretend to do work that requires external dependencies.
-    * Any utility functions described in the spec (pixel conversions,
-      data adapters, etc.) — implement these concretely.
+Required outputs:
 
-- Create `tests/test_<paper_slug>_integration.py` with passing tests for
-  every utility function you implemented concretely. Stub-test the class
-  scaffold (smoke test of the no-checkpoint path returning sensible defaults).
+1. **At least one EDIT to an existing file** in `{package}/` that
+   actually invokes your new code (the call site). A 3-line hook in
+   `evaluation.py` that calls a new scorer is the model. Without this
+   edit, the orchestrator will reject the run as scaffold-shaped.
 
-- Append a brief "(Paper Title) Integration (experimental) 🧪" section
-  to README.md. Attribute the work at the very end of the section
-  with this exact line (one Markdown link to the customer-facing
-  Remyx product page, no other URL):
+   Keep each existing-file edit small — under ~50 lines net change.
+   Larger edits get rejected.
 
-      Contributed via [Remyx Recommendation]({attribution_url}).
+2. **A capability-named module**, NOT `<paper-slug>_integration.py`.
+   Pick a name that fits the repo's existing conventions and describes
+   what the module DOES, not which paper it came from. Examples:
+   `cot_grounding_check.py`, `pointcloud_quality.py`, `mask_refiner.py`.
+   Paper attribution goes in the module docstring and README — never
+   the filename. Keep the new file focused; if you need more than ~250
+   lines, you're probably scaffolding.
 
-  Do NOT use a different URL. The orchestrator's source repo is
-  private; this link is the only one that resolves for external readers.
+3. **At least one new test that imports from a NON-NEW module** in
+   `{package}/`. Pure self-tests of the new file don't prove
+   integration. Example: a test that imports the existing call-site
+   module, exercises the wiring edit you made, and asserts the
+   integrated behavior.
 
-Run pytest before declaring done. If tests fail, fix them or scope your
-implementation down until they pass. Do not modify files outside the
-guardrails allowlist.
+4. **README append**: a short "(Capability) — adapted from (Paper Title)"
+   section at the end. Attribute with this exact line (one Markdown
+   link to the customer-facing Remyx product page):
+
+       Contributed via [Remyx Recommendation]({attribution_url}).
+
+   Do NOT use a different URL. The orchestrator's source repo is
+   private; this link is the only one that resolves for external readers.
+
+# Honesty rules
+
+- If the public surface of your new module is dominated by `TODO`,
+  `pass`, or `raise NotImplementedError` (more than ~half the
+  function bodies), you are scaffolding. STOP and write the Issue file
+  instead — the orchestrator will reject the run anyway.
+- If your new module would import cleanly but never be called by
+  anything else in the repo, STOP and write the Issue file instead.
+- The Issue-mode path is the correct route when the paper doesn't fit.
+  It is NOT a failure mode.
+
+Run pytest before declaring done. If tests fail, fix them or scope down
+to a smaller integration; do not modify files outside the guardrails
+allowlist.
 
 # CRITICAL: do not run git commands
 
 You MUST NOT run any `git` command during your session (`git init`,
 `git checkout`, `git stash`, `git reset`, `git commit`, `git add`,
-`git rm`, `git rebase`, etc. — none of them). The orchestrator manages
-all version control. Even commands you think are read-only (e.g.
-`git status`) are forbidden — past runs have hit subtle issues where
-agents ran a `git checkout` to back out a half-edit and left the
-working tree in an orphan state that broke the PR.
+`git rm`, `git rebase`, etc. — none of them, including `git status`).
+The orchestrator manages all version control. Past runs have hit
+subtle issues where agents ran a `git checkout` to back out a
+half-edit and left the working tree in an orphan state that broke
+the PR.
 
 If you need to back out an edit, use the file-edit tools to restore
-the file's content. If you're unsure what the original content was,
-look it up via the standard read tools — do not invoke git.
+the file's content. Look up the original content via standard read
+tools — do not invoke git.
 
-When complete, output a one-paragraph SUMMARY of what you actually built.
+When complete, output a one-paragraph SUMMARY of what you actually
+built. Call out:
+  - Which existing file you modified (the call site)
+  - Which new module you created (the capability name)
+  - What in the paper's method you implemented vs. left out
+
 Be honest about what you stubbed vs implemented.
+"""
+
+# Two helper Claude prompts: PR/Issue routing pre-flight (§6) and the
+# post-implementation self-review (§4). Both are rendered with str.replace()
+# rather than str.format() so the literal `{` / `}` in JSON examples don't
+# need to be doubled.
+
+_PREFLIGHT_PROMPT_TEMPLATE = """\
+You are routing a paper recommendation for the Remyx Recommendation
+orchestrator. Decide: should the implementation step run (PR), or
+should we open an Issue for the team to discuss first?
+
+Inputs follow at the end of this message:
+  1. The paper spec (title, abstract, why-this-paper, suggested experiment)
+  2. The target repo's module layout
+
+Route to ISSUE if any of these is likely true:
+
+  - The paper's primary contribution requires infrastructure that isn't
+    in the repo (a trainer when the repo is inference-only, a dataset
+    format the repo never touches, checkpoints with no loader path).
+  - There is no clear call site — no existing module that naturally
+    hosts this paper's contribution.
+  - The most realistic implementation would be a freestanding module
+    that no existing code would call.
+
+Otherwise route to PR.
+
+Output a single JSON object. Start with `{` and end with `}`. No
+Markdown fences, no prose before or after. Schema:
+
+{
+  "decision": "PR" | "ISSUE",
+  "reasoning": "<2-3 sentences explaining the call>",
+  "issue_title": "<if ISSUE: short, action-oriented title; else empty>",
+  "issue_body": "<if ISSUE: Markdown body with sections 'Why this paper
+                  is interesting for the team', 'What blocks a clean
+                  implementation', 'What we'd need to know / decide
+                  first'; else empty>"
+}
+
+--- Paper spec ---
+
+__SPEC__
+
+--- Repo layout (top-level modules in the target package + tests) ---
+
+__LAYOUT__
+"""
+
+_SELF_REVIEW_PROMPT_TEMPLATE = """\
+You are reviewing your own implementation of a paper recommendation
+before the orchestrator opens a PR.
+
+Inputs:
+  1. The original implementation spec (read `.remyx-recommendation/SPEC.md`
+     in the working directory)
+  2. The full diff of your changes (provided at the end of this message)
+
+Output a single JSON object. Start with `{` and end with `}`. No
+Markdown fences, no prose before or after. Schema:
+
+{
+  "implemented": [<bullets describing what from the paper's method is
+                   concretely implemented in your diff>],
+  "stubbed":     [<bullets describing what from the paper is left out,
+                   with required infra noted in parentheses>],
+  "call_site":   "<which existing file the new code is wired into, or
+                   '(none)' if there is no integration edit>",
+  "can_be_deleted": <true if removing your diff would NOT break or
+                    alter any existing functionality in the repo;
+                    false if removing it would lose integrated
+                    behavior>,
+  "honest_summary": "<one short paragraph: what you actually built,
+                     what's missing, whether the paper's primary
+                     contribution is really present>"
+}
+
+Be ruthless. If your new module is freestanding and never called from
+existing code, set can_be_deleted=true. If you only implemented the
+plumbing around the paper's contribution but not the contribution
+itself, list those parts as stubbed.
+
+--- Diff ---
+
+__DIFF__
 """
 
 _PR_BODY_TEMPLATE = """\
@@ -741,6 +883,192 @@ def invoke_claude_code(workdir: Path, timeout_s: int = 600) -> tuple[bool, str]:
         return False, "claude CLI not found on PATH (install: npm install -g @anthropic-ai/claude-code)"
 
 
+# ─── Pre-flight routing + self-review (§4, §6) ─────────────────────────────
+
+
+def _run_claude_oneshot(
+    workdir: Path, prompt: str, timeout_s: int
+) -> tuple[bool, str]:
+    """Run the Claude CLI headless with `prompt` and return (ok, stdout).
+
+    Used for the pre-flight routing and the self-review passes — both
+    expect a JSON object back, not a full code-generation session.
+    Failures here are non-fatal: the orchestrator falls through to the
+    normal implementation flow.
+    """
+    try:
+        result = subprocess.run(
+            ["claude", "--dangerously-skip-permissions", "-p", prompt],
+            cwd=workdir, capture_output=True, text=True, timeout=timeout_s,
+        )
+        return result.returncode == 0, (result.stdout or "")
+    except subprocess.TimeoutExpired:
+        return False, f"claude CLI timed out after {timeout_s}s"
+    except FileNotFoundError:
+        return False, "claude CLI not found on PATH"
+
+
+def _extract_json_object(s: str) -> dict | None:
+    """Pull the first JSON object out of `s`. Tolerant of prose wrappers."""
+    if not s:
+        return None
+    try:
+        start = s.index("{")
+        end = s.rindex("}")
+    except ValueError:
+        return None
+    try:
+        return json.loads(s[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _repo_layout_manifest(workdir: Path, package: str, max_lines: int = 60) -> str:
+    """Short module-by-module manifest of the target repo for pre-flight.
+
+    Lists the .py files under `{package}/` with the first line of their
+    module docstring (where present) and the names of the test files
+    under `tests/`. Capped to `max_lines` to keep the prompt cheap.
+    """
+    lines: list[str] = []
+    pkg_dir = workdir / package
+    if pkg_dir.is_dir():
+        py_files = sorted(pkg_dir.rglob("*.py"))
+        lines.append(f"# {package}/ ({len(py_files)} modules)")
+        for p in py_files:
+            rel = p.relative_to(workdir).as_posix()
+            doc_first = ""
+            try:
+                doc = ast.get_docstring(ast.parse(p.read_text())) or ""
+                doc_first = doc.splitlines()[0] if doc else ""
+            except (SyntaxError, OSError):
+                pass
+            if doc_first:
+                lines.append(f"  {rel}  — {doc_first[:80]}")
+            else:
+                lines.append(f"  {rel}")
+    tests_dir = workdir / "tests"
+    if tests_dir.is_dir():
+        test_files = sorted(tests_dir.rglob("test_*.py"))[:20]
+        if test_files:
+            lines.append(f"\n# tests/ ({len(test_files)} files shown)")
+            for p in test_files:
+                lines.append(f"  {p.relative_to(workdir).as_posix()}")
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"  ... ({len(lines) - max_lines} more)"]
+    return "\n".join(lines) or "(empty)"
+
+
+def preflight_routing(
+    workdir: Path, package: str, timeout_s: int = 180
+) -> dict | None:
+    """Cheap Claude pass that decides PR vs Issue BEFORE implementation.
+
+    Returns the parsed JSON ({decision, reasoning, issue_title, issue_body})
+    or None on any failure (parse error, timeout, missing CLI). On None
+    the orchestrator falls through to the regular implementation flow,
+    so a failed pre-flight never blocks a PR — it just doesn't save the
+    Claude budget.
+    """
+    spec_path = workdir / BUNDLE_DIR_NAME / "SPEC.md"
+    if not spec_path.exists():
+        return None
+    spec_md = spec_path.read_text()
+    layout = _repo_layout_manifest(workdir, package)
+    prompt = (
+        _PREFLIGHT_PROMPT_TEMPLATE
+        .replace("__SPEC__", spec_md)
+        .replace("__LAYOUT__", layout)
+    )
+    log.info("  → pre-flight routing pass (PR vs Issue)")
+    ok, output = _run_claude_oneshot(workdir, prompt, timeout_s)
+    if not ok:
+        log.warning(f"  pre-flight call failed: {output[:200]}; "
+                    f"falling through to implementation")
+        return None
+    data = _extract_json_object(output)
+    if data is None:
+        log.warning(f"  pre-flight: couldn't parse JSON; raw: {output[:300]!r}")
+        return None
+    decision = str(data.get("decision") or "").upper()
+    if decision not in ("PR", "ISSUE"):
+        log.warning(f"  pre-flight: invalid decision {decision!r}; "
+                    f"falling through to implementation")
+        return None
+    data["decision"] = decision
+    log.info(f"  pre-flight decision: {decision} — "
+             f"{(data.get('reasoning') or '')[:120]}")
+    return data
+
+
+def self_review_diff(
+    workdir: Path, timeout_s: int = 180
+) -> dict | None:
+    """Second Claude pass over the diff. Returns the parsed JSON or None.
+
+    Never raises and never blocks: a failure here just means the PR
+    won't get the self-review section. The integration / stub-density
+    checks are the load-bearing gates.
+    """
+    try:
+        diff_proc = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=workdir, capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        log.warning(f"  self-review: git diff failed ({e}); skipping")
+        return None
+    diff = diff_proc.stdout
+    if not diff.strip():
+        return None
+    # Cap diff size at ~80KB to keep the prompt cheap and well under
+    # any context limit the headless CLI imposes.
+    if len(diff) > 80_000:
+        diff = diff[:80_000] + "\n... (truncated)"
+    prompt = _SELF_REVIEW_PROMPT_TEMPLATE.replace("__DIFF__", diff)
+    log.info(f"  → self-review pass (diff={len(diff)} bytes)")
+    ok, output = _run_claude_oneshot(workdir, prompt, timeout_s)
+    if not ok:
+        log.warning(f"  self-review call failed: {output[:200]}")
+        return None
+    data = _extract_json_object(output)
+    if data is None:
+        log.warning(f"  self-review: couldn't parse JSON; raw: {output[:300]!r}")
+        return None
+    return data
+
+
+def _render_self_review_section(review: dict) -> str:
+    """Render the self-review JSON into a PR-body section prepended above
+    the test results. Always returns a complete Markdown block ending
+    in a blank line."""
+    impl = review.get("implemented") or []
+    stubbed = review.get("stubbed") or []
+    call_site = review.get("call_site") or "(unspecified)"
+    summary = (review.get("honest_summary") or "").strip()
+
+    def _bullets(items: list) -> str:
+        if not items:
+            return "_(none reported)_"
+        return "\n".join(f"- {x}" for x in items)
+
+    parts = [
+        "## What this PR actually does",
+        "",
+        f"**Call site**: `{call_site}`",
+        "",
+        "**Implemented from the paper**:",
+        _bullets(impl),
+        "",
+        "**Stubbed / left out**:",
+        _bullets(stubbed),
+    ]
+    if summary:
+        parts += ["", f"_{summary}_"]
+    parts.append("")
+    return "\n".join(parts)
+
+
 # ─── Validation ────────────────────────────────────────────────────────────
 
 
@@ -804,6 +1132,292 @@ def validate_changes(workdir: Path, target: Target, package: str) -> tuple[bool,
         if not path_matches_glob(p, allowlist):
             violations.append(f"NOT IN ALLOWLIST: {p}")
     return (not violations, violations)
+
+
+# ─── Integration / stub-density / test-integration validators ──────────────
+#
+# These run AFTER the path-allowlist check passes. They enforce the
+# "ready-to-ship PRs" shape: a small wiring edit to an existing file
+# that calls into a new capability-named module, with at least one
+# test that touches an existing module, and a non-stub-dominated new
+# module. Failing any of these routes the run to Issue instead of PR.
+
+
+def _file_is_new(workdir: Path, path: str) -> bool:
+    """True if `path` did not exist at HEAD (i.e. Claude created it)."""
+    result = subprocess.run(
+        ["git", "ls-tree", "HEAD", "--", path],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    )
+    return not result.stdout.strip()
+
+
+def _diff_line_changes(workdir: Path, path: str) -> tuple[int, int]:
+    """Return (added, deleted) lines for `path` vs HEAD."""
+    result = subprocess.run(
+        ["git", "diff", "--numstat", "HEAD", "--", path],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    )
+    out = result.stdout.strip()
+    if not out:
+        return 0, 0
+    parts = out.split("\t", 2)
+    if len(parts) < 2:
+        return 0, 0
+    try:
+        added = int(parts[0]) if parts[0] != "-" else 0
+        deleted = int(parts[1]) if parts[1] != "-" else 0
+    except ValueError:
+        return 0, 0
+    return added, deleted
+
+
+def _module_import_referenced(content: str, package: str, file_path: str) -> bool:
+    """True if `content` plausibly imports the module at `file_path`.
+
+    `file_path` is like 'vqasynth/cot_grounding_check.py' or
+    'vqasynth/subpkg/foo.py'. We accept any of:
+
+      - from {package}[.subpkg].{stem} import ...
+      - import {package}[.subpkg].{stem}
+      - from {package}[.subpkg] import ... {stem} ...
+      - from .[.subpkg].{stem} import ...
+      - from .[.subpkg] import ... {stem} ...
+    """
+    if not file_path.endswith(".py"):
+        return False
+    stem = Path(file_path).stem
+    if stem == "__init__":
+        return False
+    pkg_re = re.escape(package)
+    stem_re = re.escape(stem)
+    patterns = [
+        rf"\bfrom\s+{pkg_re}(?:\.[\w.]+)?\.{stem_re}\s+import\b",
+        rf"\bimport\s+{pkg_re}(?:\.[\w.]+)?\.{stem_re}\b",
+        rf"\bfrom\s+{pkg_re}(?:\.[\w.]+)?\s+import\s+[^\n]*\b{stem_re}\b",
+        rf"\bfrom\s+\.[\w.]*{stem_re}\s+import\b",
+        rf"\bfrom\s+\.[\w.]*\s+import\s+[^\n]*\b{stem_re}\b",
+    ]
+    return any(re.search(p, content) for p in patterns)
+
+
+def check_integration(
+    workdir: Path, target: Target, package: str
+) -> tuple[bool, list[str]]:
+    """Reject scaffold-shaped runs.
+
+    Pass criteria — ALL of:
+      * Number of new .py files under {package}/ ≤ MAX_NEW_PACKAGE_FILES.
+      * Each modified existing file's net change ≤
+        MAX_LINES_PER_EXISTING_FILE lines.
+      * If any new .py file was added under {package}/, at least one
+        modified existing file in {package}/ (not a test, not __init__)
+        must import or reference it.
+
+    Returns (passed, [violations]).
+    """
+    paths = changed_files(workdir)
+    pkg_prefix = f"{package}/"
+
+    new_pkg_files: list[str] = []
+    mod_pkg_files: list[str] = []
+    for p in paths:
+        if not (p.startswith(pkg_prefix) and p.endswith(".py")):
+            continue
+        if _file_is_new(workdir, p):
+            new_pkg_files.append(p)
+        else:
+            mod_pkg_files.append(p)
+
+    violations: list[str] = []
+
+    if len(new_pkg_files) > MAX_NEW_PACKAGE_FILES:
+        violations.append(
+            f"too many new files in {package}/: {len(new_pkg_files)} > "
+            f"{MAX_NEW_PACKAGE_FILES}"
+        )
+
+    for p in paths:
+        if _file_is_new(workdir, p):
+            continue
+        added, deleted = _diff_line_changes(workdir, p)
+        total = added + deleted
+        if total > MAX_LINES_PER_EXISTING_FILE:
+            violations.append(
+                f"oversized edit to existing file {p}: +{added}/-{deleted} "
+                f"> {MAX_LINES_PER_EXISTING_FILE}"
+            )
+
+    if new_pkg_files:
+        if not mod_pkg_files:
+            violations.append(
+                f"new module(s) {new_pkg_files} added but no existing file in "
+                f"{package}/ was modified — no integration point. Either wire "
+                f"the new module into an existing call site or open as Issue."
+            )
+        else:
+            for new_p in new_pkg_files:
+                referenced = False
+                for mod_p in mod_pkg_files:
+                    if mod_p.endswith("/__init__.py"):
+                        # __init__ re-exports don't prove the new code is
+                        # actually called. Continue looking for a real
+                        # call-site import.
+                        continue
+                    try:
+                        content = (workdir / mod_p).read_text()
+                    except OSError:
+                        continue
+                    if _module_import_referenced(content, package, new_p):
+                        referenced = True
+                        break
+                if not referenced:
+                    violations.append(
+                        f"new module {new_p} is not imported by any modified "
+                        f"existing file in {package}/ (other than __init__). "
+                        f"Add a wiring edit at a real call site or open as "
+                        f"Issue."
+                    )
+
+    return (not violations, violations)
+
+
+def _is_stub_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Heuristic: is this function body just a placeholder?
+
+    Treated as a stub:
+      - body is a single `pass`
+      - body is a single `...` (Ellipsis expression)
+      - body is a single `raise NotImplementedError(...)`
+      - body is docstring-only (no executable statements after it)
+
+    Not treated as a stub:
+      - return statements (even `return None`)
+      - real expressions / calls
+      - control flow
+    """
+    body = list(node.body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if not body:
+        return True
+    if len(body) != 1:
+        return False
+    stmt = body[0]
+    if isinstance(stmt, ast.Pass):
+        return True
+    if (isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis):
+        return True
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+        exc = stmt.exc
+        name = None
+        if isinstance(exc, ast.Name):
+            name = exc.id
+        elif isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name):
+            name = exc.func.id
+        if name == "NotImplementedError":
+            return True
+    return False
+
+
+def check_stub_density(
+    workdir: Path, package: str
+) -> tuple[bool, float, list[str]]:
+    """Returns (passes, density, examples).
+
+    `passes` is False iff the fraction of stub function bodies across
+    NEW .py files in `{package}/` ≥ STUB_DENSITY_DOWNGRADE_THRESHOLD.
+    Modified existing files aren't included — the wiring edits there
+    are small by design.
+    """
+    pkg_prefix = f"{package}/"
+    new_files = [
+        workdir / p for p in changed_files(workdir)
+        if p.startswith(pkg_prefix)
+        and p.endswith(".py")
+        and _file_is_new(workdir, p)
+    ]
+    if not new_files:
+        return True, 0.0, []
+
+    stub_count = 0
+    total = 0
+    examples: list[str] = []
+    for fp in new_files:
+        try:
+            tree = ast.parse(fp.read_text(), filename=str(fp))
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                total += 1
+                if _is_stub_body(node):
+                    stub_count += 1
+                    if len(examples) < 5:
+                        examples.append(f"{fp.name}:{node.name}")
+    if total == 0:
+        return True, 0.0, []
+    density = stub_count / total
+    return (density < STUB_DENSITY_DOWNGRADE_THRESHOLD, density, examples)
+
+
+def check_tests_touch_existing_modules(
+    workdir: Path, package: str
+) -> tuple[bool, list[str]]:
+    """If new package modules were added, at least one new test file must
+    import from a non-new module in `{package}/`. Pure self-tests of the
+    new file don't prove integration.
+
+    No new package modules → vacuously passes (the integration is
+    edits-only and the regular pytest gate is sufficient).
+
+    Returns (passed, [example_existing_imports_seen]).
+    """
+    paths = changed_files(workdir)
+    pkg_prefix = f"{package}/"
+    new_pkg_files = [
+        p for p in paths
+        if p.startswith(pkg_prefix) and p.endswith(".py") and _file_is_new(workdir, p)
+    ]
+    if not new_pkg_files:
+        return True, []
+
+    new_pkg_stems = {Path(p).stem for p in new_pkg_files}
+
+    new_test_files = [
+        workdir / p for p in paths
+        if p.startswith("tests/") and p.endswith(".py") and _file_is_new(workdir, p)
+    ]
+    if not new_test_files:
+        return False, []
+
+    existing_imports: list[str] = []
+    for tf in new_test_files:
+        try:
+            tree = ast.parse(tf.read_text(), filename=str(tf))
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module and (
+                    node.module == package or node.module.startswith(f"{package}.")
+                ):
+                    rest = node.module[len(package):].lstrip(".")
+                    head = rest.split(".")[0] if rest else ""
+                    if head and head not in new_pkg_stems:
+                        existing_imports.append(node.module)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == package or alias.name.startswith(f"{package}."):
+                        rest = alias.name[len(package):].lstrip(".")
+                        head = rest.split(".")[0] if rest else ""
+                        if head and head not in new_pkg_stems:
+                            existing_imports.append(alias.name)
+    return (bool(existing_imports), existing_imports[:5])
 
 
 def run_tests(workdir: Path, timeout_s: int = 300) -> tuple[bool, str]:
@@ -978,12 +1592,69 @@ def commit_and_push(workdir: Path, branch: str, title: str) -> None:
     )
 
 
+# ─── Downgrade-to-Issue helper ─────────────────────────────────────────────
+
+
+def _open_downgrade_issue(
+    target: Target, rec: Recommendation, reason: str, detail: str,
+) -> str:
+    """Open an Issue when an automated post-implementation gate downgrades
+    a PR-candidate to Issue. Used for the integration / stub-density /
+    test-integration / self-review-can-delete branches in process_target.
+
+    The body explains both *why this paper is interesting* (so the team
+    keeps the discovery signal) and *why we didn't open a PR* (so the
+    routing decision is auditable).
+    """
+    title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
+    body = (
+        f"**Recommended paper**: "
+        f"[{rec.paper_title}](https://arxiv.org/abs/{rec.arxiv_id})\n"
+        f"**Confidence**: {rec.tier} "
+        f"(Remyx relevance {rec.relevance_score:.2f})\n"
+        f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
+        f"\n---\n\n"
+        f"## Why this paper is interesting for the team\n\n"
+        f"{rec.reasoning or '(no reasoning provided)'}\n\n"
+        f"## Suggested experiment\n\n"
+        f"{rec.suggested_experiment or '(none)'}\n\n"
+        f"## Why the orchestrator opened an Issue instead of a PR\n\n"
+        f"**{reason}**\n\n"
+        f"{detail}\n"
+    )
+    return open_issue(target, title, body)
+
+
 # ─── Main per-target loop ──────────────────────────────────────────────────
 
 
 def process_target(target: Target) -> dict:
     """Run the full discovery + implementation loop for one target.
-    Returns a status dict suitable for logging / Slack notify."""
+    Returns a status dict suitable for logging / Slack notify.
+
+    Routing summary — every path leads to either a PR, an Issue, or a
+    skip:
+
+        skipped_low_confidence            — tier below min_confidence
+        skipped_rate_limit                — recent PR within rate-limit-days
+        skipped_pr_exists                 — open PR already exists for paper
+
+        issue_opened_preflight            — pre-flight (§6) routed to Issue
+                                            before invoking implementation
+        issue_opened                      — Claude wrote OPEN_AS_ISSUE.md
+        issue_opened_no_integration       — integration validator (§2) rejected
+        issue_opened_stub_density         — stub-density validator (§3) rejected
+        issue_opened_no_test_integration  — test gate (§3) found no test that
+                                            imports an existing module
+        issue_opened_self_review          — self-review (§4) says diff can be
+                                            deleted with no functional loss
+
+        rejected_path_violations          — Claude touched out-of-bounds paths
+        skipped_test_failure              — draft_mode=never and tests failed
+        claude_failed                     — Claude CLI exited non-zero
+
+        pr_opened / pr_opened_draft       — happy path
+    """
     result: dict = {"repo": target.repo, "status": "unknown"}
 
     # 1+2. Query + gate
@@ -1020,6 +1691,39 @@ def process_target(target: Target) -> dict:
         log.info(f"  detected package: {package}")
         write_spec_bundle(workdir, target, rec, package)
 
+        # 5.5. Pre-flight Issue routing (§6). Cheap Claude pass that
+        # decides PR vs Issue before we spend the implementation budget.
+        # Failures here fall through — they don't block the PR path.
+        preflight = preflight_routing(workdir, package)
+        result["preflight_decision"] = (
+            preflight.get("decision") if preflight else "(skipped)"
+        )
+        if preflight and preflight.get("decision") == "ISSUE":
+            issue_title_inner = (
+                preflight.get("issue_title")
+                or f"{rec.paper_title}: needs team discussion"
+            )
+            issue_body_inner = (
+                preflight.get("issue_body")
+                or preflight.get("reasoning")
+                or ""
+            )
+            issue_url = _open_downgrade_issue(
+                target, rec,
+                reason="Pre-flight routed to Issue before implementation",
+                detail=(
+                    f"{issue_body_inner}\n\n"
+                    f"_Pre-flight reasoning: "
+                    f"{preflight.get('reasoning', '(none)')}_"
+                ),
+            )
+            # Override the body title with the preflight's title — it's
+            # more specific than the generic paper title.
+            result["status"] = "issue_opened_preflight"
+            result["issue_url"] = issue_url
+            log.info(f"  ✓ issue_opened_preflight: {issue_url}")
+            return result
+
         # 6. Claude Code
         ok, claude_log = invoke_claude_code(workdir)
         result["claude_exit_ok"] = ok
@@ -1031,17 +1735,13 @@ def process_target(target: Target) -> dict:
             result["status"] = "claude_failed"
             return result
 
-        # 6.5. Claude may have elected Issue-mode instead of writing code
-        # (paper can't be cleanly scaffolded against this codebase; spec
-        # too vague; needed infra missing; etc.). When it does, the brief
-        # told it to write OPEN_AS_ISSUE.md INSTEAD of any code, so no
-        # PR makes sense — open an Issue with its reasoning.
+        # 6.5. Claude may have elected Issue-mode instead of writing code.
         issue_file = workdir / ISSUE_FALLBACK_FILENAME
         if issue_file.exists():
             log.info(f"  → Claude elected Issue-mode "
                      f"({ISSUE_FALLBACK_FILENAME} present); opening Issue")
             issue_title_inner, issue_body_inner = parse_issue_fallback_file(issue_file)
-            issue_title = f"[Remyx Recommendation] {issue_title_inner}"
+            issue_title = f"{PR_TITLE_PREFIX} {issue_title_inner}"
             issue_body = (
                 f"**Recommended paper**: "
                 f"[{rec.paper_title}](https://arxiv.org/abs/{rec.arxiv_id})\n"
@@ -1057,7 +1757,7 @@ def process_target(target: Target) -> dict:
             log.info(f"  ✓ issue_opened: {issue_url}")
             return result
 
-        # 7. Path allowlist enforcement
+        # 7. Path allowlist enforcement.
         passed_allowlist, violations = validate_changes(workdir, target, package)
         if not passed_allowlist:
             result["status"] = "rejected_path_violations"
@@ -1065,9 +1765,125 @@ def process_target(target: Target) -> dict:
             log.warning(f"  ✗ path violations: {violations}")
             return result
 
+        # 7.5. Integration validator (§2). Rejects scaffold-shaped runs:
+        # new module added with no existing-file edit referencing it,
+        # too many new files, or oversized edits to existing files.
+        passed_integration, int_violations = check_integration(
+            workdir, target, package
+        )
+        if not passed_integration:
+            result["integration_violations"] = int_violations
+            log.warning(f"  ✗ integration check failed: {int_violations}")
+            issue_url = _open_downgrade_issue(
+                target, rec,
+                reason="No real integration with the existing codebase",
+                detail=(
+                    "The implementation either added new modules without "
+                    "wiring them into an existing call site, added too many "
+                    "new files, or rewrote an existing file too aggressively. "
+                    "Specifics:\n\n"
+                    + "\n".join(f"- {v}" for v in int_violations)
+                ),
+            )
+            result["status"] = "issue_opened_no_integration"
+            result["issue_url"] = issue_url
+            return result
+
+        # 7.6. Stub density (§3). Routes to Issue if the new module's
+        # public surface is dominated by pass / NotImplementedError /
+        # empty bodies — i.e. the paper's contribution isn't really
+        # present.
+        density_ok, density, stub_examples = check_stub_density(workdir, package)
+        result["stub_density"] = density
+        if not density_ok:
+            log.warning(
+                f"  ✗ stub density {density:.0%} ≥ "
+                f"{STUB_DENSITY_DOWNGRADE_THRESHOLD:.0%}; downgrading to Issue"
+            )
+            issue_url = _open_downgrade_issue(
+                target, rec,
+                reason=(
+                    f"New module is mostly unimplemented "
+                    f"({density:.0%} of function bodies are stubs)"
+                ),
+                detail=(
+                    "The orchestrator's coding agent produced a module "
+                    "whose public surface is dominated by `pass`, "
+                    "`raise NotImplementedError`, or docstring-only "
+                    "bodies. This usually means the paper's primary "
+                    "contribution requires infra the repo doesn't have, "
+                    "or there's no clear call site to extend.\n\n"
+                    "Examples of stub bodies in the draft:\n\n"
+                    + "\n".join(f"- `{e}`" for e in stub_examples)
+                ),
+            )
+            result["status"] = "issue_opened_stub_density"
+            result["issue_url"] = issue_url
+            return result
+
         # 8. Tests
         tests_passed, test_output = run_tests(workdir)
         result["tests_passed"] = tests_passed
+
+        # 8.5. Test-touches-existing-modules gate (§3). If new package
+        # modules were added, at least one new test must import from a
+        # non-new module in the package — otherwise tests are pure
+        # self-tests and don't prove integration.
+        tests_touch_existing, existing_imports = (
+            check_tests_touch_existing_modules(workdir, package)
+        )
+        result["tests_touch_existing"] = tests_touch_existing
+        if not tests_touch_existing:
+            log.warning(
+                "  ✗ no new test imports from an existing module — "
+                "tests only self-test the new file"
+            )
+            issue_url = _open_downgrade_issue(
+                target, rec,
+                reason=(
+                    "New tests don't touch any pre-existing module"
+                ),
+                detail=(
+                    "A new module was added, but none of the new test "
+                    "files import from a pre-existing module in "
+                    f"`{package}/`. Pure self-tests of the new file "
+                    "don't prove the integration runs against existing "
+                    "pipeline outputs."
+                ),
+            )
+            result["status"] = "issue_opened_no_test_integration"
+            result["issue_url"] = issue_url
+            return result
+
+        # 9. Self-review (§4). Second Claude pass over the diff. Renders
+        # a "What this PR actually does" section into the PR body; if it
+        # judges the diff deletable with no loss, routes to Issue.
+        review = self_review_diff(workdir)
+        result["self_review"] = review or {}
+        if review and review.get("can_be_deleted") is True:
+            log.warning(
+                "  ✗ self-review says diff is deletable with no loss; "
+                "downgrading to Issue"
+            )
+            summary = review.get("honest_summary") or ""
+            issue_url = _open_downgrade_issue(
+                target, rec,
+                reason="Self-review judged the diff deletable with no loss",
+                detail=(
+                    "On a second pass over the diff, the coding agent "
+                    "concluded that removing the changes would not "
+                    "break or alter existing functionality. That's the "
+                    "definition of an orphan scaffold — routing to "
+                    "Issue.\n\n"
+                    f"_Self-review summary: {summary}_"
+                ),
+            )
+            result["status"] = "issue_opened_self_review"
+            result["issue_url"] = issue_url
+            return result
+        review_section = _render_self_review_section(review) if review else ""
+
+        # 10. Draft determination.
         if target.draft_mode == "always":
             draft = True
         elif target.draft_mode == "never":
@@ -1079,9 +1895,12 @@ def process_target(target: Target) -> dict:
         else:                                # "on_test_failure"
             draft = not tests_passed
 
-        # 9. Commit + push + PR
+        # 11. Commit + push + PR
         pr_title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
-        pr_body = build_pr_body(target, rec, tests_passed, test_output)
+        pr_body = build_pr_body(
+            target, rec, tests_passed, test_output,
+            review_section=review_section,
+        )
         commit_and_push(workdir, branch, pr_title)
         pr_url = open_pr(target, branch, pr_title, pr_body, draft=draft)
         result["status"] = "pr_opened_draft" if draft else "pr_opened"
@@ -1095,12 +1914,26 @@ def process_target(target: Target) -> dict:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
-def build_pr_body(target: Target, rec: Recommendation, tests_passed: bool, test_output: str) -> str:
+def build_pr_body(
+    target: Target,
+    rec: Recommendation,
+    tests_passed: bool,
+    test_output: str,
+    review_section: str = "",
+) -> str:
     tier_emoji = {"high": "🟢", "moderate": "🟡", "low": "🟠", "noise": "🔴"}.get(rec.tier, "⚪")
-    test_section = (
+    test_section_inner = (
         "### Test results\n\n✅ All tests passed.\n"
         if tests_passed else
         f"### Test results\n\n⚠️ Tests did not pass. PR opened as draft for review.\n\n```\n{test_output[-1000:]}\n```\n"
+    )
+    # Self-review section (§4) goes ABOVE the test section so reviewers
+    # see "what this PR actually does vs. what's stubbed" before the
+    # green checkmark.
+    test_section = (
+        f"{review_section}\n{test_section_inner}"
+        if review_section else
+        test_section_inner
     )
     return _PR_BODY_TEMPLATE.format(
         paper_title=rec.paper_title,
