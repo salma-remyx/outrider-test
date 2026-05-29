@@ -147,3 +147,31 @@ def test_pr_body_without_selection_note():
     tgt = Target(repo="remyxai/VQASynth", interest_id="x")
     body = run.build_pr_body(tgt, geo, True, "ok")
     assert "Why this candidate" not in body
+
+
+def test_spec_bundle_threads_selection_rationale(tmp_path):
+    # The selection rationale must land in SPEC.md so pre-flight and the
+    # implementer see the same scoped framing the selection pass reasoned
+    # about (rather than re-deriving from the abstract).
+    geo, _ = _make_candidates()
+    tgt = Target(repo="remyxai/VQASynth", interest_id="x")
+    run.write_spec_bundle(
+        tmp_path, tgt, geo, "vqasynth",
+        selection_note="Implementable subset: load the released benchmark and "
+                       "score via existing inference; call sites benchmarks.py / "
+                       "evaluation.py.",
+    )
+    spec = (tmp_path / ".remyx-recommendation" / "SPEC.md").read_text()
+    assert "How this maps onto your repo (candidate selection)" in spec
+    assert "call sites benchmarks.py" in spec
+
+
+def test_spec_bundle_neutral_note_on_fallback(tmp_path):
+    geo, _ = _make_candidates()
+    tgt = Target(repo="remyxai/VQASynth", interest_id="x")
+    run.write_spec_bundle(
+        tmp_path, tgt, geo, "vqasynth",
+        selection_note="(selection pass unavailable — used top-ranked candidate)",
+    )
+    spec = (tmp_path / ".remyx-recommendation" / "SPEC.md").read_text()
+    assert "no separate selection rationale" in spec

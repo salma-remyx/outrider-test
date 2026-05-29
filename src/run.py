@@ -167,6 +167,10 @@ _SPEC_MD_TEMPLATE = """\
 
 {reasoning}
 
+## How this maps onto your repo (candidate selection)
+
+{selection_block}
+
 ## Suggested experiment
 
 {suggested_experiment}
@@ -366,17 +370,32 @@ should we open an Issue for the team to discuss first?
 
 Inputs follow at the end of this message:
   1. The paper spec (title, abstract, why-this-paper, suggested experiment)
-  2. The target repo's module layout
+  2. A candidate-selection rationale (in the spec, under "How this maps
+     onto your repo") — when present, a prior pass already judged this
+     paper implementable against THIS repo and named the call sites and
+     the implementable SUBSET it targets.
+  3. The target repo's module layout
 
-Route to ISSUE if any of these is likely true:
+Evaluate the SCOPED implementation the selection rationale describes — the
+implementable subset wired into the named call sites — NOT the paper's
+full or maximal contribution. A paper whose maximal form needs missing
+infra (a trainer, a renderer, a synthesis engine) can still be a sound PR
+if the selection rationale identifies a real, smaller slice that drops
+into an existing call site (e.g. consuming a paper's released benchmark
+through the existing eval path, rather than rebuilding its data-generation
+engine). Don't route to ISSUE merely because the paper's headline method
+is heavy — judge the scoped slice.
 
-  - The paper's primary contribution requires infrastructure that isn't
-    in the repo (a trainer when the repo is inference-only, a dataset
-    format the repo never touches, checkpoints with no loader path).
-  - There is no clear call site — no existing module that naturally
-    hosts this paper's contribution.
-  - The most realistic implementation would be a freestanding module
-    that no existing code would call.
+Route to ISSUE only if any of these is likely true of THAT scoped slice:
+
+  - Even the scoped implementation requires infrastructure that isn't in
+    the repo (a trainer when the repo is inference-only, a data format the
+    repo never touches, checkpoints with no loader path).
+  - There is no clear call site — no existing module that naturally hosts
+    even the scoped contribution (and the selection rationale, if present,
+    names none that hold up against the layout).
+  - The most realistic implementation would be a freestanding module that
+    no existing code would call.
 
 Otherwise route to PR.
 
@@ -881,8 +900,22 @@ def detect_package_name(workdir: Path) -> str:
     return "src"
 
 
-def write_spec_bundle(workdir: Path, target: Target, rec: Recommendation, package: str) -> None:
-    """Write the .remyx-recommendation/ bundle that Claude Code reads as its brief."""
+def write_spec_bundle(
+    workdir: Path, target: Target, rec: Recommendation, package: str,
+    selection_note: str = "",
+) -> None:
+    """Write the .remyx-recommendation/ bundle that Claude Code reads as its brief.
+
+    ``selection_note`` is the candidate-selection rationale: why this
+    paper was picked from the pool as the most implementable against THIS
+    repo, including the call sites it targets. It's written into the spec
+    so BOTH the pre-flight routing pass and the implementer evaluate the
+    same scoped framing the selection pass reasoned about — without it,
+    pre-flight re-derives PR-vs-Issue from the abstract alone and can
+    contradict the selection (e.g. judging a benchmark paper's maximal
+    form needs infra the repo lacks, while the selection identified an
+    implementable subset).
+    """
     bundle = workdir / BUNDLE_DIR_NAME
     bundle.mkdir(exist_ok=True)
 
@@ -890,6 +923,12 @@ def write_spec_bundle(workdir: Path, target: Target, rec: Recommendation, packag
         rec.interest_context
         if rec.interest_context
         else "(no research-focus body configured for this interest on engine.remyx.ai)"
+    )
+    note = (selection_note or "").strip()
+    selection_block = (
+        note
+        if note and not note.startswith("(")
+        else "(no separate selection rationale — this was the top-ranked candidate)"
     )
     (bundle / "SPEC.md").write_text(_SPEC_MD_TEMPLATE.format(
         paper_title=rec.paper_title,
@@ -899,6 +938,7 @@ def write_spec_bundle(workdir: Path, target: Target, rec: Recommendation, packag
         interest_name=rec.interest_name or "(unnamed interest)",
         interest_context_block=interest_block,
         reasoning=rec.reasoning or "(no reasoning provided)",
+        selection_block=selection_block,
         suggested_experiment=rec.suggested_experiment or "(none)",
         paper_abstract=rec.paper_abstract or "(abstract unavailable)",
     ))
@@ -1898,9 +1938,14 @@ def process_target(target: Target) -> dict:
         })
         log.info(f"  ✓ selected: [{rec.tier}] {rec.paper_title}")
 
-        # 5. Spec bundle for the chosen candidate.
+        # 5. Spec bundle for the chosen candidate. Thread the selection
+        # rationale through so pre-flight and the implementer evaluate the
+        # same scoped framing the selection pass reasoned about.
         branch = f"{BRANCH_PREFIX}{rec.arxiv_id or slugify(rec.paper_title)}"
-        write_spec_bundle(workdir, target, rec, package)
+        write_spec_bundle(
+            workdir, target, rec, package,
+            selection_note=result.get("selection_reasoning", ""),
+        )
 
         # 5.5. Pre-flight Issue routing (§6). Cheap Claude pass that
         # decides PR vs Issue before we spend the implementation budget.
