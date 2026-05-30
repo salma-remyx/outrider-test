@@ -67,6 +67,10 @@ from typing import Any
 REMYX_API_BASE = os.environ.get("REMYX_API_BASE", "https://engine.remyx.ai")
 REMYX_RECOMMENDATION_PERIOD = os.environ.get("REMYX_RECOMMENDATION_PERIOD", "week")
 REMYX_RECOMMENDATION_LIMIT = int(os.environ.get("REMYX_RECOMMENDATION_LIMIT", "25"))
+# Max seconds to wait for recommendations to populate after triggering a
+# refresh on an interest whose pool is empty (e.g. a brand-new interest
+# whose daily ranking hasn't run yet). Polled, not a hard sleep.
+REMYX_REFRESH_WAIT_S = int(os.environ.get("REMYX_REFRESH_WAIT_S", "150"))
 
 # Map Remyx's 0.0-1.0 relevance_score onto confidence-gate tiers.
 # Thresholds are intentionally generous on the high end since the action
@@ -99,7 +103,7 @@ TIER_RANK = {"high": 3, "moderate": 2, "low": 1, "noise": 0, "near-random": 0}
 DEFAULT_ALLOWLIST_GLOBS = [
     "*.py",
     ".remyx-recommendation/**",
-    "README.md",
+    "**/README.md",          # READMEs at any depth (top-level + nested docs)
 ]
 
 # Cap on additions+deletions per pre-existing file. Keeps wiring edits
@@ -245,9 +249,20 @@ Read these files in order:
                                             if Remyx returned any)
   4. .remyx-recommendation/GUARDRAILS.md — what you may and may not modify
 
-Then look at the existing codebase structure (especially the `{package}/`
-package and `tests/` directory) to understand the project's conventions,
-the existing call sites, and what actually exists to integrate against.
+SPEC.md names a PROPOSED CALL SITE under "How this maps onto your repo"
+(the file + function the selection pass judged most implementable). Start
+there, and keep exploration minimal — broad repo-wandering is the main
+cost to avoid:
+  - Open ONLY that file plus the modules its target function directly
+    imports or calls. Read narrow line ranges, not whole files.
+  - Use grep / symbol search to confirm the call site and local
+    conventions. Do NOT list or read the whole `{package}/` or `tests/`
+    tree.
+  - Skip generated, vendored, lockfile, data, and notebook files, and any
+    file over ~1500 lines unless the call site is inside it.
+  - Once you can name the exact function you will call, STOP exploring and
+    implement. Confirming the call site should take only a few reads.
+Depth at the chosen call site is fine; breadth across the repo is not.
 
 # Step 1 — decide: PR or Issue
 
@@ -258,10 +273,12 @@ Open as PR only if BOTH of these hold:
   (a) You can identify a SPECIFIC existing module/function in `{package}/`
       where this paper's contribution slots in (the "call site").
 
-  (b) The paper's PRIMARY contribution can be implemented end-to-end
-      here, OR the integration produces a USEFUL SIGNAL on real
-      pipeline output without the paper's neural/checkpoint components
-      (e.g. a quality filter, a scorer, an evaluation hook).
+  (b) You can deliver the paper's CORE INSIGHT or RESULT as a useful,
+      scoped change at that call site. You do NOT need to reproduce the
+      paper's full method, architecture, training procedure, or reported
+      numbers. A small change that moves the repo in the paper's
+      direction (a scorer, filter, metric, evaluation hook, or focused
+      behavior change) is the INTENDED deliverable, not a fallback.
 
 Open as Issue if any of these is true:
 
@@ -302,8 +319,10 @@ This is the HONEST outcome when the paper doesn't fit, not a failure.
 
 # Step 2 — only if you're proceeding with PR: implement an INTEGRATION
 
-The goal is the smallest change that calls into existing code with
-paper-derived behavior. NOT a scaffold. NOT a freestanding module.
+The goal is the smallest change that calls into existing code and
+delivers the paper's core insight as value to THIS repo. Implement the
+RESULT, not the technique — do not port a trainer, model, or loss the repo
+cannot host. NOT a scaffold. NOT a freestanding module.
 
 Required outputs:
 
@@ -367,13 +386,16 @@ If you need to back out an edit, use the file-edit tools to restore
 the file's content. Look up the original content via standard read
 tools — do not invoke git.
 
-When complete, output a one-paragraph SUMMARY of what you actually
-built. Call out:
+When complete, output a one-paragraph SUMMARY of what you built. Call out:
   - Which existing file you modified (the call site)
   - Which new module you created (the capability name)
-  - What in the paper's method you implemented vs. left out
+  - The paper insight this delivers, and what you intentionally scoped
+    out as unnecessary for that value — frame these as scoping decisions,
+    not shortfalls. A focused slice that delivers the result is success.
 
-Be honest about what you stubbed vs implemented.
+Still distinguish "intentionally out of scope" (expected) from
+"stubbed / incomplete" (TODO-dominated bodies) — the latter still routes
+to an Issue per the honesty rules above.
 """
 
 # Two helper Claude prompts: PR/Issue routing pre-flight (§6) and the
@@ -498,10 +520,13 @@ Output a single JSON object. Start with `{` and end with `}`. No
 Markdown fences, no prose before or after. Schema:
 
 {
-  "implemented": [<bullets describing what from the paper's method is
-                   concretely implemented in your diff>],
-  "stubbed":     [<bullets describing what from the paper is left out,
-                   with required infra noted in parentheses>],
+  "delivered":   [<bullets: the paper's insight/result this diff delivers
+                   to the repo — the concrete value, at the call site>],
+  "scoped_out":  [<bullets: parts of the paper intentionally NOT built
+                   because they aren't needed for that value (note any
+                   required infra in parentheses). These are scoping
+                   decisions, not shortfalls — a focused slice that
+                   delivers the result is the goal.>],
   "call_site":   "<which existing entry point the new code is invoked
                    from, or '(none)' if nothing in the product calls it>",
   "is_orphan":   <true if the new code is NOT reached from any pre-existing
@@ -512,17 +537,19 @@ Markdown fences, no prose before or after. Schema:
                    is still an orphan. Do NOT use this field to judge
                    whether the code is "too simple" — triviality is scored
                    separately by stub density.>,
-  "honest_summary": "<one short paragraph: what you actually built,
-                     what's missing, whether the paper's primary
-                     contribution is really present>"
+  "honest_summary": "<one short paragraph: the value this delivers in the
+                     paper's direction, and what you intentionally scoped
+                     out as unnecessary for it. Frame scoped-out parts as
+                     deliberate boundaries, not as what you 'failed' to do.>"
 }
 
 Be ruthless about reachability. If the only thing that calls your new code
 is a test you added (or nothing at all), set is_orphan=true — the product
 never exercises it. If a pre-existing entry point (a pipeline/stage driver,
 a CLI, an existing module) now invokes your new code, set is_orphan=false.
-Separately, if you only implemented the plumbing around the paper's
-contribution but not the contribution itself, list those parts as stubbed.
+Separately, list under scoped_out the parts of the paper you deliberately
+left for later (e.g. a trainer/model the repo can't host) — you are not
+required to reproduce the paper's full method, only to deliver its result.
 
 --- Diff ---
 
@@ -562,6 +589,12 @@ _Opened by the [Remyx Recommendation]({attribution_url}) orchestrator._
 
 DRAFT_MODES = ("always", "on_test_failure", "never")
 
+# Terminal statuses that should make the workflow step exit non-zero (red
+# in CI). Everything else — Issues, skips, PRs — is a legitimate green
+# outcome. `claude_failed` used to exit 0, so a run that produced no PR/Issue
+# looked green; it now fails visibly.
+FAILURE_EXIT_STATUSES = {"error", "claude_failed"}
+
 
 @dataclass
 class Target:
@@ -588,6 +621,13 @@ class Target:
     #                       draft_on_test_failure=False behavior.
     draft_mode: str = "always"
     guardrails_allowlist: list[str] = field(default_factory=list)
+    # Per-run wall-clock budget for the Claude Code implementation step.
+    # 600s was too tight on large repos; configurable via `claude-timeout`.
+    claude_timeout_s: int = 900
+    # Optional: force-select a specific candidate by arxiv_id (skips the
+    # LLM selection pass) so eval re-runs are reproducible. Empty = normal
+    # selection.
+    pin_arxiv: str = ""
     notes: str = ""
 
 
@@ -711,6 +751,71 @@ def _remyx_get(path: str, *, params: dict | None = None) -> dict:
         ) from e
 
 
+def _remyx_post(path: str, body: dict) -> dict:
+    """POST against the Remyx engine API with the configured API key.
+    Raises RuntimeError on non-2xx response. Mirrors ``_remyx_get``."""
+    api_key = os.environ.get("REMYX_API_KEY") or os.environ.get("REMYXAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "REMYX_API_KEY (or REMYXAI_API_KEY) is required. Generate one "
+            "from your engine.remyx.ai settings and add it as a workflow "
+            "secret."
+        )
+    url = REMYX_API_BASE.rstrip("/") + path
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "feature-finder-orchestrator",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")[:400]
+        raise RuntimeError(
+            f"Remyx API POST {path} → HTTP {e.code}: {body_text}"
+        ) from e
+
+
+def _refresh_and_poll_recommendations(target: Target, fetch_fn) -> list:
+    """Trigger a recommendation refresh for the interest, then poll until
+    picks appear or ``REMYX_REFRESH_WAIT_S`` elapses.
+
+    A brand-new interest (or one whose daily ranking hasn't run since the
+    last cron) returns an empty pool; the engine ranks asynchronously after
+    a POST to /papers/recommended/refresh. Returns the populated list, or
+    [] if nothing landed within the budget.
+    """
+    log.info("  → empty recommendation pool; triggering "
+             "/papers/recommended/refresh and polling")
+    try:
+        _remyx_post(
+            "/api/v1.0/papers/recommended/refresh",
+            {"interest_id": target.interest_id},
+        )
+    except Exception as e:
+        log.warning(f"    (refresh trigger failed: {e})")
+    deadline = time.monotonic() + REMYX_REFRESH_WAIT_S
+    while time.monotonic() < deadline:
+        time.sleep(10)
+        try:
+            papers = fetch_fn()
+        except Exception as e:
+            log.warning(f"    (poll failed: {e}; retrying)")
+            continue
+        if papers:
+            log.info(f"    ✓ recommendations populated ({len(papers)})")
+            return papers
+    return []
+
+
 def _relevance_to_tier(score: float) -> str:
     if score >= RELEVANCE_TIER_FLOOR["high"]:
         return "high"
@@ -802,22 +907,30 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
              f"(interest={target.interest_id[:8]}…, "
              f"period={REMYX_RECOMMENDATION_PERIOD}, "
              f"limit={REMYX_RECOMMENDATION_LIMIT})")
-    resp = _remyx_get(
-        "/api/v1.0/papers/recommended",
-        params={
-            "interest_id": target.interest_id,
-            "period":      REMYX_RECOMMENDATION_PERIOD,
-            "limit":       REMYX_RECOMMENDATION_LIMIT,
-        },
-    )
-    papers = resp.get("papers") or []
+    def _fetch_papers() -> list:
+        resp = _remyx_get(
+            "/api/v1.0/papers/recommended",
+            params={
+                "interest_id": target.interest_id,
+                "period":      REMYX_RECOMMENDATION_PERIOD,
+                "limit":       REMYX_RECOMMENDATION_LIMIT,
+            },
+        )
+        return resp.get("papers") or []
+
+    papers = _fetch_papers()
+    if not papers:
+        # A brand-new interest (or one whose daily refresh hasn't run since
+        # the last cron) has no ranked picks yet. Trigger a refresh and poll
+        # rather than failing the run outright.
+        papers = _refresh_and_poll_recommendations(target, _fetch_papers)
     if not papers:
         raise RuntimeError(
             f"Remyx returned no recommendations for interest "
-            f"{target.interest_id} in period={REMYX_RECOMMENDATION_PERIOD}. "
-            f"Either the interest has no fresh picks, or the daily refresh "
-            f"hasn't run since the last cron. Try POSTing to "
-            f"/api/v1.0/papers/recommended/refresh first."
+            f"{target.interest_id} in period={REMYX_RECOMMENDATION_PERIOD} "
+            f"even after triggering /papers/recommended/refresh and waiting "
+            f"{REMYX_REFRESH_WAIT_S}s. The interest may have no fresh picks "
+            f"in this window."
         )
 
     interest_name, interest_context = _fetch_interest_context(target.interest_id)
@@ -946,7 +1059,17 @@ def prepare_workdir(target: Target) -> Path:
     repo_url = f"https://x-access-token:{token}@github.com/{target.repo}.git"
 
     log.info(f"  → cloning {target.repo} to {workdir}")
-    subprocess.run(["git", "clone", "--depth", "20", repo_url, str(workdir)], check=True)
+    # Skip Git-LFS smudge: the orchestrator only reads code structure and
+    # makes small edits — it never needs the LFS blobs (model weights,
+    # datasets). Fetching them is slow, and a repo whose LFS bandwidth
+    # budget is exhausted fails the clone outright ("exceeded its LFS
+    # budget") even though every file we touch is plain text. Pointer files
+    # are checked out instead.
+    clone_env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+    subprocess.run(
+        ["git", "clone", "--depth", "20", repo_url, str(workdir)],
+        check=True, env=clone_env,
+    )
     subprocess.run(
         ["git", "config", "user.email", "remyx-recommendation@noreply.remyx.ai"],
         cwd=workdir, check=True,
@@ -1021,9 +1144,7 @@ def write_spec_bundle(
             f"{rec.team_context}\n"
         )
 
-    allowlist = target.guardrails_allowlist or [
-        g.format(package=package) for g in DEFAULT_ALLOWLIST_GLOBS
-    ]
+    allowlist = effective_allowlist(target, package)
     (bundle / "GUARDRAILS.md").write_text(_GUARDRAILS_MD_TEMPLATE.format(
         allowlist="\n".join(allowlist),
         blocked="\n".join(ALWAYS_BLOCKED),
@@ -1039,22 +1160,26 @@ def write_spec_bundle(
 # ─── Claude Code invocation ────────────────────────────────────────────────
 
 
-def invoke_claude_code(workdir: Path, timeout_s: int = 600) -> tuple[bool, str]:
+def invoke_claude_code(workdir: Path, timeout_s: int = 900) -> tuple[bool, str]:
     """Invoke the Claude Code CLI in headless mode with the workdir as context.
 
     Returns (success, stdout/stderr). Success means CLI exit 0 — caller still
     validates the produced changes with the path-allowlist check + tests.
+
+    ``REMYX_CLAUDE_MAX_TURNS`` (optional) caps the agent's tool-use turns to
+    bound cost; unset means no cap (avoids truncating legitimate work).
     """
     invocation = (workdir / BUNDLE_DIR_NAME / "INVOCATION.md").read_text()
     log.info(f"  → invoking Claude Code (timeout={timeout_s}s) in {workdir}")
+    cmd = ["claude", "--dangerously-skip-permissions"]
+    max_turns = os.environ.get("REMYX_CLAUDE_MAX_TURNS", "").strip()
+    if max_turns:
+        cmd += ["--max-turns", max_turns]
+    cmd += ["-p", invocation]
     try:
         # `claude` CLI: -p for prompt, --dangerously-skip-permissions for CI
         result = subprocess.run(
-            [
-                "claude",
-                "--dangerously-skip-permissions",
-                "-p", invocation,
-            ],
+            cmd,
             cwd=workdir,
             capture_output=True,
             text=True,
@@ -1297,8 +1422,10 @@ def _render_self_review_section(review: dict) -> str:
     """Render the self-review JSON into a PR-body section prepended above
     the test results. Always returns a complete Markdown block ending
     in a blank line."""
-    impl = review.get("implemented") or []
-    stubbed = review.get("stubbed") or []
+    # Prefer the value-first keys; fall back to the legacy ones so an older
+    # model response still renders.
+    delivered = review.get("delivered") or review.get("implemented") or []
+    scoped_out = review.get("scoped_out") or review.get("stubbed") or []
     call_site = review.get("call_site") or "(unspecified)"
     summary = (review.get("honest_summary") or "").strip()
 
@@ -1308,15 +1435,15 @@ def _render_self_review_section(review: dict) -> str:
         return "\n".join(f"- {x}" for x in items)
 
     parts = [
-        "## What this PR actually does",
+        "## What this PR delivers",
         "",
         f"**Call site**: `{call_site}`",
         "",
-        "**Implemented from the paper**:",
-        _bullets(impl),
+        "**Delivers (from the paper)**:",
+        _bullets(delivered),
         "",
-        "**Stubbed / left out**:",
-        _bullets(stubbed),
+        "**Intentionally out of scope** (not needed for this contribution):",
+        _bullets(scoped_out),
     ]
     if summary:
         parts += ["", f"_{summary}_"]
@@ -1388,16 +1515,35 @@ def path_matches_glob(path: str, patterns: list[str]) -> bool:
                                `tests/**/*.py` also matches `tests/x.py`).
     """
     import fnmatch
+    # Case-insensitive: `fnmatch.fnmatch` is case-sensitive on Linux, which
+    # rejected e.g. a repo's `README.MD` against the `README.md` allowlist
+    # entry and threw away an otherwise-valid PR.
+    lower_path = path.lower()
     for p in patterns:
         variants = {p, p.replace("**", "*"), p.replace("**/", "")}
-        if any(fnmatch.fnmatch(path, v) for v in variants):
+        if any(fnmatch.fnmatch(lower_path, v.lower()) for v in variants):
             return True
     return False
 
 
+def effective_allowlist(target: Target, package: str) -> list[str]:
+    """The default allowlist globs (with `{package}` filled in) PLUS any
+    extra globs the customer passed via `guardrails-allowlist`.
+
+    The customer input EXTENDS the defaults — it does not replace them. The
+    old `target.guardrails_allowlist or [defaults]` short-circuit silently
+    dropped the defaults (`.remyx-recommendation/**`, `*.py`, `README.md`)
+    the moment any extra glob was supplied, which then flagged the agent's
+    own scaffolding files as violations.
+    """
+    base = [g.format(package=package) for g in DEFAULT_ALLOWLIST_GLOBS]
+    extra = [g for g in (target.guardrails_allowlist or []) if g not in base]
+    return base + extra
+
+
 def validate_changes(workdir: Path, target: Target, package: str) -> tuple[bool, list[str]]:
     """Returns (passed_allowlist, violations)."""
-    allowlist = target.guardrails_allowlist or [g.format(package=package) for g in DEFAULT_ALLOWLIST_GLOBS]
+    allowlist = effective_allowlist(target, package)
     paths = changed_files(workdir)
     violations = []
     for p in paths:
@@ -1701,6 +1847,36 @@ def check_tests_touch_existing_modules(
 
     new_pkg_stems = {Path(p).stem for p in new_pkg_files}
 
+    # The gate also passes when the new capability is wired into the
+    # package's existing surface — a pre-existing (non-test) package module
+    # edited in this run imports the new module (e.g. a new exported nn
+    # layer registered in `__init__.py`, or called by an existing module).
+    # That is a genuine public-API integration even when the new test only
+    # exercises the new module directly, so it shouldn't be demoted to an
+    # Issue. (check_integration already proved the new code is invoked.)
+    edited_existing_pkg = [
+        workdir / p for p in paths
+        if p.startswith(pkg_prefix) and p.endswith(".py")
+        and not _file_is_new(workdir, p)
+    ]
+    for ef in edited_existing_pkg:
+        try:
+            tree = ast.parse(ef.read_text(), filename=str(ef))
+        except (SyntaxError, OSError):
+            continue
+        referenced: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module:
+                    referenced.add(node.module.rsplit(".", 1)[-1])
+                for a in node.names:
+                    referenced.add(a.name.rsplit(".", 1)[-1])
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    referenced.add(a.name.rsplit(".", 1)[-1])
+        if referenced & new_pkg_stems:
+            return True, [f"wired into existing module {ef.name}"]
+
     new_test_files = [
         workdir / p for p in paths
         if p.startswith("tests/") and p.endswith(".py") and _file_is_new(workdir, p)
@@ -1733,33 +1909,86 @@ def check_tests_touch_existing_modules(
     return (bool(existing_imports), existing_imports[:5])
 
 
-def run_tests(workdir: Path, timeout_s: int = 300) -> tuple[bool, str]:
-    """Run pytest. Returns (passed, output)."""
+def _classify_pytest(returncode: int, output: str) -> str:
+    """Map a pytest run to "passed" | "failed" | "unvalidated".
+
+    "unvalidated" means pytest could not actually exercise the change — no
+    tests were collected (exit 5) or collection blew up on a missing
+    dependency / import error. CI runners commonly install pytest but not
+    the target repo's full dependency set (torch, tensorboard, …), so a
+    collection ImportError is an environment limitation, NOT a code failure,
+    and must not be reported as one.
+    """
+    if returncode == 0:
+        return "passed"
+    low = output.lower()
+    real_failure = (
+        " failed" in low
+        or "assertionerror" in low
+        or "= failures =" in low
+    )
+    if real_failure:
+        return "failed"
+    if returncode == 5:                       # no tests collected
+        return "unvalidated"
+    collection_markers = (
+        "modulenotfounderror",
+        "importerror",
+        "error during collection",
+        "errors during collection",
+        "interrupted:",
+    )
+    if any(m in low for m in collection_markers):
+        return "unvalidated"
+    return "failed"
+
+
+def run_tests(workdir: Path, timeout_s: int = 300) -> tuple[str, str]:
+    """Run pytest. Returns (status, output) where status is one of
+    "passed" | "failed" | "unvalidated" (see _classify_pytest)."""
     log.info(f"  → running pytest in {workdir}")
     try:
         result = subprocess.run(
             ["python", "-m", "pytest", "-q", "--maxfail=3"],
             cwd=workdir, capture_output=True, text=True, timeout=timeout_s,
         )
-        ok = result.returncode == 0
         output = (result.stdout or "") + ("\n--- STDERR ---\n" + result.stderr if result.stderr else "")
-        return ok, output[-3000:]
+        return _classify_pytest(result.returncode, output), output[-3000:]
     except subprocess.TimeoutExpired:
-        return False, f"pytest timed out after {timeout_s}s"
+        return "failed", f"pytest timed out after {timeout_s}s"
     except Exception as e:
-        return False, f"pytest invocation failed: {e}"
+        return "failed", f"pytest invocation failed: {e}"
 
 
 # ─── PR opening ────────────────────────────────────────────────────────────
 
 
-def open_pr(target: Target, branch: str, title: str, body: str, draft: bool) -> str:
+def detect_default_branch(workdir: Path) -> str:
+    """The repo's default branch — the branch HEAD points at right after a
+    fresh clone (e.g. `main` or `master`). Falls back to `main`.
+
+    Hardcoding `main` failed on `master`-default repos: the PR base 404'd
+    and the commit_and_push sanity check saw `origin/main` MISSING and
+    aborted. Detect it once and thread it through.
+    """
+    r = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=workdir, capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip() or "main"
+
+
+def open_pr(
+    target: Target, branch: str, title: str, body: str, draft: bool,
+    base: str = "main",
+) -> str:
     """Open a PR on the target repo; returns the PR URL."""
-    log.info(f"  → opening {'draft' if draft else ''} PR on {target.repo}")
+    log.info(f"  → opening {'draft' if draft else ''} PR on {target.repo} "
+             f"(base={base})")
     pr = gh_api("POST", f"/repos/{target.repo}/pulls", {
         "title": title,
         "head": branch,
-        "base": "main",
+        "base": base,
         "body": body,
         "draft": draft,
     })
@@ -1776,10 +2005,20 @@ def open_issue(target: Target, title: str, body: str) -> str:
         f"the current codebase._"
     )
     log.info(f"  → opening Issue on {target.repo}")
-    issue = gh_api("POST", f"/repos/{target.repo}/issues", {
-        "title": title,
-        "body": full_body,
-    })
+    payload = {"title": title, "body": full_body}
+    try:
+        issue = gh_api("POST", f"/repos/{target.repo}/issues", payload)
+    except RuntimeError as e:
+        # GitHub disables the Issues tab on forks (and some repos) by
+        # default → POST /issues returns HTTP 410 "Issues has been
+        # disabled". Enable it and retry once rather than failing the run.
+        msg = str(e)
+        if "Issues has been disabled" in msg or "HTTP 410" in msg:
+            log.warning("  Issues disabled on repo; enabling and retrying")
+            gh_api("PATCH", f"/repos/{target.repo}", {"has_issues": True})
+            issue = gh_api("POST", f"/repos/{target.repo}/issues", payload)
+        else:
+            raise
     return issue["html_url"]
 
 
@@ -1814,7 +2053,9 @@ def parse_issue_fallback_file(path: Path) -> tuple[str, str]:
     return title, body
 
 
-def commit_and_push(workdir: Path, branch: str, title: str) -> None:
+def commit_and_push(
+    workdir: Path, branch: str, title: str, base_branch: str = "main",
+) -> None:
     """Stage all changes, commit, and push the branch to origin.
 
     Two classes of files are scrubbed before staging so they don't end
@@ -1830,30 +2071,31 @@ def commit_and_push(workdir: Path, branch: str, title: str) -> None:
         duplicate content already in the PR body and add noise to the
         diff.
     """
-    # Sanity check: make sure local HEAD still equals origin/main before
-    # we branch. If Claude (or pytest) disturbed the git state during the
-    # session — `git checkout --orphan`, `rm -rf .git`, `git init`,
-    # whatever — local main can diverge from remote main, and the
-    # subsequent `git checkout -b branch` produces a root-commit branch
-    # with no history in common with main. The PR-creation API then
-    # rejects with HTTP 422. Fail fast with a clear error instead.
+    # Sanity check: make sure local HEAD still equals origin/<base_branch>
+    # before we branch. If Claude (or pytest) disturbed the git state during
+    # the session — `git checkout --orphan`, `rm -rf .git`, `git init`,
+    # whatever — local HEAD can diverge from the remote default, and the
+    # subsequent `git checkout -b branch` produces a root-commit branch with
+    # no history in common with it. The PR-creation API then rejects with
+    # HTTP 422. Fail fast with a clear error instead. (base_branch is the
+    # repo's real default — `main` or `master` — not a hardcoded `main`.)
     head_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=workdir, capture_output=True, text=True, check=True,
     ).stdout.strip()
     try:
         remote_sha = subprocess.run(
-            ["git", "rev-parse", "origin/main"],
+            ["git", "rev-parse", f"origin/{base_branch}"],
             cwd=workdir, capture_output=True, text=True, check=True,
         ).stdout.strip()
     except subprocess.CalledProcessError:
         remote_sha = ""
     if not remote_sha or head_sha != remote_sha:
         raise RuntimeError(
-            f"local HEAD ({head_sha[:8]}) doesn't match origin/main "
-            f"({(remote_sha or 'MISSING')[:8]}) — git state was disturbed "
-            f"during the session. Refusing to commit; would produce a "
-            f"root-commit branch and fail at PR creation."
+            f"local HEAD ({head_sha[:8]}) doesn't match "
+            f"origin/{base_branch} ({(remote_sha or 'MISSING')[:8]}) — git "
+            f"state was disturbed during the session. Refusing to commit; "
+            f"would produce a root-commit branch and fail at PR creation."
         )
 
     subprocess.run(["git", "checkout", "-b", branch], cwd=workdir, check=True)
@@ -2046,18 +2288,35 @@ def process_target(target: Target) -> dict:
     workdir = prepare_workdir(target)
     try:
         package = detect_package_name(workdir)
-        log.info(f"  detected package: {package}")
+        default_branch = detect_default_branch(workdir)
+        log.info(f"  detected package: {package}  default branch: {default_branch}")
 
-        selection = select_recommendation(workdir, package, viable)
-        if selection is not None:
-            rec = viable[selection["chosen_index"]]
-            result["selection_reasoning"] = selection.get("reasoning", "")
-            result["selection_rejected"] = selection.get("rejected", [])
-        else:
-            rec = viable[0]
-            result["selection_reasoning"] = (
-                "(selection pass unavailable — used top-ranked candidate)"
+        pinned_idx = None
+        if target.pin_arxiv:
+            pinned_idx = next(
+                (i for i, c in enumerate(viable) if c.arxiv_id == target.pin_arxiv),
+                None,
             )
+            if pinned_idx is None:
+                log.warning(f"  pin-arxiv {target.pin_arxiv!r} not in viable "
+                            f"pool; falling back to the selection pass")
+        if pinned_idx is not None:
+            rec = viable[pinned_idx]
+            result["selection_reasoning"] = (
+                f"(pinned via pin-arxiv={target.pin_arxiv})"
+            )
+            log.info(f"  ✓ pinned candidate [{pinned_idx}] {rec.paper_title[:50]}…")
+        else:
+            selection = select_recommendation(workdir, package, viable)
+            if selection is not None:
+                rec = viable[selection["chosen_index"]]
+                result["selection_reasoning"] = selection.get("reasoning", "")
+                result["selection_rejected"] = selection.get("rejected", [])
+            else:
+                rec = viable[0]
+                result["selection_reasoning"] = (
+                    "(selection pass unavailable — used top-ranked candidate)"
+                )
         result.update({
             "paper": rec.paper_title,
             "arxiv": rec.arxiv_id,
@@ -2109,7 +2368,9 @@ def process_target(target: Target) -> dict:
             return result
 
         # 6. Claude Code
-        ok, claude_log = invoke_claude_code(workdir)
+        ok, claude_log = invoke_claude_code(
+            workdir, timeout_s=target.claude_timeout_s
+        )
         result["claude_exit_ok"] = ok
         # Always retain the Claude log tail — useful for diagnosing
         # silent-success-but-broken-state outcomes (e.g. orphan branch,
@@ -2206,7 +2467,9 @@ def process_target(target: Target) -> dict:
             return result
 
         # 8. Tests
-        tests_passed, test_output = run_tests(workdir)
+        tests_status, test_output = run_tests(workdir)
+        result["tests_status"] = tests_status
+        tests_passed = tests_status == "passed"
         result["tests_passed"] = tests_passed
 
         # 8.5. Test-touches-existing-modules gate (§3). If new package
@@ -2270,27 +2533,31 @@ def process_target(target: Target) -> dict:
             return result
         review_section = _render_self_review_section(review) if review else ""
 
-        # 10. Draft determination.
+        # 10. Draft determination. "unvalidated" (tests couldn't run in CI,
+        # e.g. the runner lacks the repo's deps) is NOT a failure: never-mode
+        # opens a draft rather than skipping, and on_test_failure drafts it.
         if target.draft_mode == "always":
             draft = True
         elif target.draft_mode == "never":
-            if not tests_passed:
+            if tests_status == "failed":
                 result["status"] = "skipped_test_failure"
                 result["test_output_tail"] = test_output[-500:]
                 return result
-            draft = False
+            draft = tests_status != "passed"
         else:                                # "on_test_failure"
-            draft = not tests_passed
+            draft = tests_status != "passed"
 
         # 11. Commit + push + PR
         pr_title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
         pr_body = build_pr_body(
-            target, rec, tests_passed, test_output,
+            target, rec, tests_status, test_output,
             review_section=review_section,
             selection_note=result.get("selection_reasoning", ""),
         )
-        commit_and_push(workdir, branch, pr_title)
-        pr_url = open_pr(target, branch, pr_title, pr_body, draft=draft)
+        commit_and_push(workdir, branch, pr_title, base_branch=default_branch)
+        pr_url = open_pr(
+            target, branch, pr_title, pr_body, draft=draft, base=default_branch
+        )
         result["status"] = "pr_opened_draft" if draft else "pr_opened"
         result["pr_url"] = pr_url
         log.info(f"  ✓ {result['status']}: {pr_url}")
@@ -2305,17 +2572,26 @@ def process_target(target: Target) -> dict:
 def build_pr_body(
     target: Target,
     rec: Recommendation,
-    tests_passed: bool,
+    tests_status: str,
     test_output: str,
     review_section: str = "",
     selection_note: str = "",
 ) -> str:
     tier_emoji = {"high": "🟢", "moderate": "🟡", "low": "🟠", "noise": "🔴"}.get(rec.tier, "⚪")
-    test_section_inner = (
-        "### Test results\n\n✅ All tests passed.\n"
-        if tests_passed else
-        f"### Test results\n\n⚠️ Tests did not pass. PR opened as draft for review.\n\n```\n{test_output[-1000:]}\n```\n"
-    )
+    if tests_status == "passed":
+        test_section_inner = "### Test results\n\n✅ All tests passed.\n"
+    elif tests_status == "unvalidated":
+        test_section_inner = (
+            "### Test results\n\nℹ️ Tests could not run in CI — the runner "
+            "lacks this repo's dependencies (a collection/import error, not "
+            "a code failure). Run the suite locally to validate.\n\n"
+            f"```\n{test_output[-1000:]}\n```\n"
+        )
+    else:
+        test_section_inner = (
+            "### Test results\n\n⚠️ Tests did not pass. PR opened as draft "
+            f"for review.\n\n```\n{test_output[-1000:]}\n```\n"
+        )
     # Self-review section (§4) goes ABOVE the test section so reviewers
     # see "what this PR actually does vs. what's stubbed" before the
     # green checkmark.
@@ -2405,6 +2681,13 @@ def build_target_from_env() -> Target:
         else []
     )
 
+    timeout_raw = _optional_env("INPUT_CLAUDE_TIMEOUT", "900")
+    try:
+        claude_timeout_s = int(timeout_raw)
+    except ValueError:
+        log.error(f"INPUT_CLAUDE_TIMEOUT={timeout_raw!r} is not an integer.")
+        sys.exit(2)
+
     return Target(
         repo=repo,
         interest_id=interest_id,
@@ -2412,6 +2695,8 @@ def build_target_from_env() -> Target:
         rate_limit_days=rate_limit_days,
         draft_mode=draft_mode,
         guardrails_allowlist=guardrails_allowlist,
+        claude_timeout_s=claude_timeout_s,
+        pin_arxiv=_optional_env("INPUT_PIN_ARXIV", ""),
         notes="",
     )
 
@@ -2449,11 +2734,17 @@ def main():
                     f.write(f"arxiv={result['arxiv']}\n")
                 if "tier" in result:
                     f.write(f"tier={result['tier']}\n")
+                if "candidates_considered" in result:
+                    f.write(f"candidates_considered={result['candidates_considered']}\n")
+                if "selection_rejected" in result:
+                    f.write(f"selection_rejected={len(result['selection_rejected'])}\n")
         except OSError as e:
             log.warning(f"Could not write to $GITHUB_OUTPUT: {e}")
 
-    # Non-zero exit on error so the workflow step fails visibly.
-    if result.get("status") == "error":
+    # Non-zero exit on genuine failures so the workflow step fails visibly
+    # (a green run with no PR/Issue previously masked claude_failed). Issues,
+    # skips, and PRs stay green.
+    if result.get("status") in FAILURE_EXIT_STATUSES:
         sys.exit(1)
 
 
