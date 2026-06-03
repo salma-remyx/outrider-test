@@ -18,7 +18,22 @@ Scouts the arXiv frontier for your repo. On a schedule you choose, Outrider pick
 - **Issues** when a PR would be premature — pre-flight, validators, or self-review route the paper to discussion instead of scaffold-shaped PRs
 - **One artifact per `rate-limit-days`** by default — no Issue spam
 
-## Setup (5 minutes)
+## Setup
+
+Two install paths — pick whichever fits.
+
+### One-command install (CLI)
+
+The [`remyxai` CLI](https://github.com/remyxai/remyxai-cli) installs Outrider on a target repo via the Remyx GitHub App: writes the workflow, sets the repo secrets, and opens a bot-authored setup PR. Your local git isn't touched.
+
+```bash
+pip install remyxai
+remyxai outrider init --repo owner/name --auto-interest
+```
+
+Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Settings) and an Anthropic key (`--anthropic-key` or `ANTHROPIC_API_KEY`). The `--auto-interest` flag auto-creates a `ResearchInterest` from the repo if one doesn't exist; drop it if you already have an interest UUID to wire in. If the Remyx GitHub App isn't installed on the target repo yet, the command surfaces the install link.
+
+### Manual install (5 minutes)
 
 1. **Sign up at [engine.remyx.ai](https://engine.remyx.ai)** and connect your repo. Remyx ingests your commit history and creates a `ResearchInterest`. Edit its context body to sharpen the framing.
 
