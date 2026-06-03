@@ -166,10 +166,12 @@ Query engine.remyx.ai for the candidate pool + interest context
        ↓
 Rate-limit + per-paper dedup + confidence gates
        ↓
-Selection pass: verify each promising candidate against the target repo
+Clone the target repo + detect package / default branch
+       ↓
+Selection pass: verify each promising candidate against the cloned repo
 (gh code-search + file reads). May reject all and exit early.
        ↓
-Clone, write the .remyx-recommendation/ spec bundle
+Write the .remyx-recommendation/ spec bundle
        ↓
 Pre-flight Claude pass: PR or Issue?
        ↓                              ↓
