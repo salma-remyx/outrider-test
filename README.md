@@ -108,7 +108,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 
 <details>
-<summary><b>Status codes</b> (15 outcomes)</summary>
+<summary><b>Status codes</b> (16 outcomes)</summary>
 
 | Status | Meaning |
 |---|---|
@@ -124,6 +124,7 @@ At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 | `skipped_rate_limit` | A Remyx PR or Issue was opened within `rate-limit-days` |
 | `skipped_pr_exists` | Every candidate already has an open PR |
 | `skipped_issue_exists` | Every candidate already has an open Remyx Issue — close one to retry that paper |
+| `skipped_by_selection_verification` | Selection pass verified every candidate against the repo and rejected all (none structurally fit the existing modules) |
 | `skipped_test_failure` | Tests failed AND `draft-mode: never` |
 | `claude_failed` | Claude CLI exited non-zero |
 | `rejected_path_violations` | Claude touched files outside the guardrails allowlist |
@@ -165,7 +166,8 @@ Query engine.remyx.ai for the candidate pool + interest context
        ↓
 Rate-limit + per-paper dedup + confidence gates
        ↓
-Selection pass: which candidate is most implementable against this repo?
+Selection pass: verify each promising candidate against the target repo
+(gh code-search + file reads). May reject all and exit early.
        ↓
 Clone, write the .remyx-recommendation/ spec bundle
        ↓
