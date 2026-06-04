@@ -1581,7 +1581,7 @@ def _render_candidate_brief(candidates: list[Recommendation]) -> str:
 def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
     target: "Target | None" = None,
-    timeout_s: int = 180,
+    timeout_s: int | None = None,
 ) -> dict | None:
     """Claude pass that picks the most implementable candidate from the
     lookback pool, given the target repo's module layout.
@@ -1612,9 +1612,17 @@ def select_recommendation(
     # observed via eval that 15 is too tight on repos with zero open
     # Issues (the loop spends turns hunting context that doesn't exist).
     max_turns = int(os.environ.get("REMYX_SELECTION_MAX_TURNS", "25"))
+    # Wall-clock budget for the selection pass. Default 360s gives the
+    # agentic loop room for 20-25 verification turns including code
+    # searches + per-candidate contract checks; 180s was too tight after
+    # the v1.3.4 / v1.3.5 prompt extensions and caused selection to
+    # time out and fall back to the top-ranked candidate (observed on
+    # remyxai/VQASynth run #7 on 2026-06-04).
+    if timeout_s is None:
+        timeout_s = int(os.environ.get("REMYX_SELECTION_TIMEOUT_S", "360"))
     log.info(
         f"  → agentic selection over {len(candidates)} candidates "
-        f"(max-turns={max_turns})"
+        f"(max-turns={max_turns}, timeout={timeout_s}s)"
     )
     ok, output = _run_claude_oneshot(workdir, prompt, timeout_s, max_turns=max_turns)
     if not ok:
