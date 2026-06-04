@@ -110,7 +110,7 @@ Requires `REMYXAI_API_KEY` (from [engine.remyx.ai](https://engine.remyx.ai) Sett
 At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 
 <details>
-<summary><b>Status codes</b> (17 outcomes)</summary>
+<summary><b>Status codes</b> (18 outcomes)</summary>
 
 | Status | Meaning |
 |---|---|
@@ -127,6 +127,7 @@ At weekly cadence (default `rate-limit-days: 7`), expect ~$2–4/mo Claude.
 | `skipped_pr_exists` | Every candidate already has an open PR |
 | `skipped_issue_exists` | Every candidate already has an open Remyx Issue — close one to retry that paper |
 | `skipped_by_selection_verification` | Selection pass verified every candidate against the repo and rejected all (none structurally fit the existing modules) |
+| `issue_opened_substitution` | Selection identified a replacement / pipeline-simplification candidate (vs. additive drop-in); routed to Issue because the swap needs dep changes the PR guardrails block |
 | `skipped_test_failure` | Tests failed AND `draft-mode: never` |
 | `claude_failed` | Claude CLI exited non-zero |
 | `rejected_path_violations` | Claude touched files outside the guardrails allowlist |

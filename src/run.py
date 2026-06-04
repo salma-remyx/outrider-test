@@ -506,6 +506,39 @@ iteratively. For your most promising candidate(s):
     extends (`gh issue list --repo <repo> --state open --search "..."`
     or `gh issue view <n> --repo <repo>` for specific Issues).
 
+**Three legitimate integration shapes — classify each candidate you
+consider.** A candidate that does NOT fit one of these three shapes is
+a structural mismatch and should be rejected.
+
+  - **addition** — paper adds a NEW module that is called from EXISTING
+    code. The repo's current modules stay; new code is wired in. Most
+    common shape. Verification: existing call site exists, the new
+    module's I/O contract fits the forward path.
+
+  - **replacement** — paper's contribution is a strict drop-in
+    REPLACEMENT for an existing component with the same input/output
+    contract but better internals (smaller / faster / simpler / newer
+    foundation). The existing component is removed; the new one slots
+    into its place. Verification: identify the existing component's
+    I/O contract; confirm the paper's contract is functionally
+    equivalent; estimate migration cost (which files change).
+
+  - **simplification** — paper merges TWO OR MORE existing components
+    into one with the same end-to-end contract. Pipeline collapses.
+    Verification: identify the existing pipeline's boundary contract;
+    confirm the merged contribution spans those boundaries cleanly;
+    estimate migration cost.
+
+Replacement and simplification need a STRICTER bar than addition: the
+I/O contracts must align functionally, not just thematically. A paper
+that "could replace" an existing component but whose actual inputs or
+outputs differ from what downstream code expects is a structural
+mismatch, not a replacement. Surface keyword overlap (same domain, same
+technique name) does NOT make a replacement — only contract-equivalent
+substitution does. Stein-Encoder is NOT a replacement for SteinVI even
+though both invoke "Stein's method" — the I/O contracts are different
+problem classes.
+
 If after verification the pre-fetched candidates all turn out to be
 poor structural fits, you MAY broaden the search:
   - `remyxai search query "<technique>"` — search the broader Remyx
@@ -527,8 +560,9 @@ Tools available:
   - `remyxai search query` — broaden beyond the pool if needed
 
 Stop iterating once you have enough evidence to pick (verified one
-candidate fits) OR to reject all (every candidate has a structural
-mismatch). Don't burn turns on diminishing returns.
+candidate fits one of the three shapes) OR to reject all (every
+candidate has a structural mismatch). Don't burn turns on diminishing
+returns.
 
 Output a single JSON object. Start with `{` and end with `}`. No Markdown
 fences, no prose before or after. Schema:
@@ -537,21 +571,37 @@ fences, no prose before or after. Schema:
   "chosen_index": <integer index into the candidate list below, or -1
                    if every candidate failed verification>,
   "chosen_call_site": "<the specific path:function you verified the
-                        paper plugs into; omit when chosen_index = -1>",
+                        paper plugs into for `addition`, or the existing
+                        component(s) being replaced for `replacement` /
+                        `simplification`; omit when chosen_index = -1>",
+  "integration_shape": "addition" | "replacement" | "simplification"
+                       (omit when chosen_index = -1),
+  "contract_match": "<one line — REQUIRED for replacement /
+                      simplification: how the existing component's I/O
+                      contract and the paper's contract align (and where
+                      they don't). Omit for addition.>",
+  "migration_cost": "<one line — REQUIRED for replacement /
+                      simplification: list of files that would change in
+                      a real swap (factory function, requirements,
+                      tests, docs). Omit for addition.>",
   "verification_summary": "<one line: what you actually verified to
                             pick this — e.g. 'gh code-search confirmed
                             torchtune/training/quantization/_quantize.py
                             hosts the bit-allocation step the paper
                             extends'>",
   "reasoning": "<2-3 sentences: why this candidate's contribution maps
-                 cleanly onto the verified call site; cite an Issue
-                 number if alignment surfaced one>",
+                 cleanly onto the verified call site (addition) or why
+                 the contract match is clean (replacement /
+                 simplification); cite an Issue number if alignment
+                 surfaced one>",
   "rejected": [
     {"index": <int>, "why": "<one line: why this candidate fails
                               verification — e.g. 'paper assumes a
                               trainer the repo lacks', or 'shared
                               keyword but different problem class
-                              (verified via <path>)'>"}
+                              (verified via <path>)', or 'proposed as
+                              replacement but I/O contract differs:
+                              X vs Y'>"}
   ]
 }
 
@@ -2439,6 +2489,14 @@ def process_target(target: Target) -> dict:
         issue_opened_self_review          — self-review (§4): new code is an
                                             orphan, unreachable from production
 
+        issue_opened_substitution         — agentic selection identified a
+                                            replacement / pipeline-
+                                            simplification candidate (vs.
+                                            additive drop-in); routed to
+                                            Issue because the swap needs
+                                            dep changes the PR guardrails
+                                            block
+
         rejected_path_violations          — Claude touched out-of-bounds paths
         skipped_by_selection_verification — agentic selection verified every
                                             ranker candidate and rejected
@@ -2569,6 +2627,46 @@ def process_target(target: Target) -> dict:
                 result["selection_rejected"] = _enrich_selection_rejected(
                     selection.get("rejected") or [], viable
                 )
+                # Substitution routing — replacement / simplification
+                # recommendations need dep changes the PR guardrails block
+                # (requirements.txt, factory wiring, often test fixtures).
+                # Open as an Issue with the contract analysis instead of a
+                # half-built PR.
+                shape = (selection.get("integration_shape") or "addition").lower().strip()
+                result["selection_integration_shape"] = shape
+                if shape in ("replacement", "simplification"):
+                    contract_match = selection.get("contract_match", "")
+                    migration_cost = selection.get("migration_cost", "")
+                    shape_label = (
+                        "drop-in replacement"
+                        if shape == "replacement"
+                        else "pipeline simplification"
+                    )
+                    detail = (
+                        f"**Integration shape**: {shape_label}\n\n"
+                        f"**Contract match**: {contract_match or '(none reported)'}\n\n"
+                        f"**Migration cost**: {migration_cost or '(none reported)'}\n\n"
+                        f"_Selection reasoning_: {selection.get('reasoning', '')}\n\n"
+                        f"This swap touches dependency files and existing module "
+                        f"boundaries — changes that fall outside Outrider's "
+                        f"auto-PR guardrails. Opening as an Issue so the team "
+                        f"can decide whether to merge the upgrade."
+                    )
+                    issue_url = _open_downgrade_issue(
+                        target, rec,
+                        reason=f"Selection identified a {shape_label} candidate",
+                        detail=detail,
+                    )
+                    result.update({
+                        "paper": rec.paper_title,
+                        "arxiv": rec.arxiv_id,
+                        "tier": rec.tier,
+                        "candidates_considered": len(viable),
+                        "status": "issue_opened_substitution",
+                        "issue_url": issue_url,
+                    })
+                    log.info(f"  ✓ issue_opened_substitution ({shape}): {issue_url}")
+                    return result
             else:
                 rec = viable[0]
                 result["selection_reasoning"] = (
@@ -3059,6 +3157,7 @@ def _write_step_summary(result: dict) -> None:
         "skipped_pr_exists":       "⏭️",
         "skipped_issue_exists":    "⏭️",
         "skipped_by_selection_verification": "⏭️",
+        "issue_opened_substitution": "🔁",
         "skipped_test_failure":    "⏭️",
         "claude_failed":           "❌",
         "rejected_path_violations":"❌",
