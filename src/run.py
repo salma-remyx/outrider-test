@@ -1691,10 +1691,13 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
         )
         for p in papers
     ]
-    # Deep-search refine. Opt-IN: an extra Claude call + a few GitHub
-    # API calls + N /search/assets calls, so we want field observability
-    # before flipping the default. Set REMYX_DEEP_SEARCH=1 to enable.
-    if os.environ.get("REMYX_DEEP_SEARCH", "0") == "1":
+    # Deep-search refine — on by default. Costs one extra Claude call
+    # (~$0.5–1.0 per run) plus a few GitHub API calls + N /search/assets
+    # calls; in return, the audit pass catches papers the broad ranking
+    # misses because they fall outside the repo's import graph. Opt out
+    # with REMYX_DEEP_SEARCH=0 if the cost isn't worth it for a given
+    # target.
+    if os.environ.get("REMYX_DEEP_SEARCH", "1") != "0":
         candidates = audit_and_refine_pool(
             target, candidates,
             interest_name=interest_name,
