@@ -43,6 +43,7 @@ GITHUB_TOKEN are passed through unchanged.
 from __future__ import annotations
 
 import ast
+import base64
 import datetime as dt
 import json
 import logging
@@ -1210,6 +1211,346 @@ def _paper_to_recommendation(
     )
 
 
+# ─── Deep-search retrieval loop ────────────────────────────────────────────
+#
+# The broad pass (/papers/recommended) only surfaces candidates whose
+# embedding profile matches what the engine has already indexed for the
+# interest — which means themes adjacent to but outside the repo's
+# import graph (substitutes for an imported model, training-recipe
+# upgrades, alternative implementations of a stage) never reach the
+# candidate pool. The audit pass clusters the broad pool, compares
+# against the repo's recent Issue history + README scope to spot
+# under-represented themes, drafts 1-3 refine queries, and pulls extra
+# candidates from /search/assets to merge into the final pool.
+
+
+def _remyx_search_assets(
+    query: str, max_results: int = 5, use_llm: bool = True,
+) -> list[dict]:
+    """POST ``/api/v1.0/search/assets`` and return the raw asset list.
+
+    Mirrors the remyxai-cli `search_assets` helper (same auth, same
+    endpoint). Returns the asset dicts as-is so the caller can map them
+    into ``Recommendation`` objects with provenance metadata attached.
+    Never raises — a flaky refine fetch shouldn't break the broad pool.
+    """
+    if not query or not query.strip():
+        return []
+    body = {
+        "query": query.strip(),
+        "max_results": min(max(1, int(max_results)), 50),
+        "use_llm": use_llm,
+    }
+    try:
+        resp = _remyx_post("/api/v1.0/search/assets", body)
+    except Exception as e:
+        log.warning(f"    refine query {query!r} failed: {e}")
+        return []
+    return resp.get("assets") or []
+
+
+def _asset_to_recommendation(
+    asset: dict, refine_query: str,
+    fallback_interest_name: str, interest_context: str,
+    experiment_history: str,
+) -> Recommendation:
+    """Map one /search/assets envelope entry to a Recommendation.
+
+    The asset envelope differs from /papers/recommended: it carries
+    `github_url`, `categories`, `abstract` at the top level, no
+    `reasoning`, and no `relevance_score`. The refine query is
+    threaded into the synthetic reasoning so downstream renderers
+    (the candidate brief, selection prompt) can see how this candidate
+    reached the pool.
+    """
+    arxiv_id = (asset.get("arxiv_id") or "").strip()
+    title = (asset.get("title") or "(untitled)").strip()
+    abstract = (asset.get("abstract") or "").strip()
+    paper_github_url = (asset.get("github_url") or "").strip()
+    # Search results carry no engine-ranked relevance — they're keyword/
+    # LLM-matched against a free-text query, not the interest's profile.
+    # Synthesize a score that lands in the "moderate" tier (≥ 0.60 by
+    # default) so refine candidates survive the default min_confidence
+    # filter; the selection pass still chooses among the pool on its
+    # own merits. Sits below the broad pool's typical relevance so a
+    # tied selection prefers a ranked candidate.
+    synthetic_relevance = 0.65
+    reasoning = (
+        f"Surfaced by Outrider deep-search refine query "
+        f"`{refine_query}` against /search/assets. The engine's "
+        f"normal Gemini ranking did not place this paper in the "
+        f"interest's broad pool — it's here because the audit pass "
+        f"identified an under-represented theme this paper covers."
+    )
+    return Recommendation(
+        paper_title=title,
+        arxiv_id=arxiv_id,
+        tier=_relevance_to_tier(synthetic_relevance),
+        z_score=0.0,
+        spec_md="",
+        paper_abstract=abstract,
+        domain_summary="",
+        raw_paper_md="",
+        relevance_score=synthetic_relevance,
+        reasoning=reasoning,
+        suggested_experiment="",
+        recommendation_id="",
+        interest_name=fallback_interest_name,
+        interest_context=interest_context,
+        experiment_history=experiment_history,
+        paper_github_url=paper_github_url,
+    )
+
+
+def _fetch_repo_readme(repo: str, max_chars: int = 2000) -> str:
+    """Return the target repo's README (truncated), or ``""``.
+
+    Used as a scope hint for the audit pass — anchors what themes the
+    maintainer says the repo is *about*, which can diverge from what
+    the import graph alone would suggest. Best-effort, never raises.
+    """
+    try:
+        resp = gh_api("GET", f"/repos/{repo}/readme")
+    except Exception as e:
+        log.debug(f"  README fetch for {repo} failed: {e}")
+        return ""
+    content = resp.get("content") or ""
+    encoding = resp.get("encoding") or ""
+    if encoding == "base64":
+        try:
+            decoded = base64.b64decode(content).decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:
+            return ""
+    else:
+        decoded = content
+    decoded = decoded.strip()
+    if len(decoded) > max_chars:
+        decoded = decoded[:max_chars].rstrip() + "\n…[truncated]"
+    return decoded
+
+
+def _recent_outrider_issue_titles(
+    target: Target, n: int = 8,
+) -> list[str]:
+    """Return the last ``n`` Outrider-opened Issue titles on the target.
+
+    Includes closed Issues — they still represent territory Outrider has
+    already covered, so they count toward "themes the audit pass should
+    look beyond." Title-only (we don't need the bodies for theme
+    audit). Best-effort, returns ``[]`` on fetch failure.
+    """
+    try:
+        raw = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues"
+            f"?state=all&sort=created&direction=desc&per_page=30",
+        ) or []
+    except Exception as e:
+        log.debug(f"  recent-issues fetch for {target.repo} failed: {e}")
+        return []
+    titles: list[str] = []
+    for it in raw:
+        if it.get("pull_request"):
+            continue
+        title = (it.get("title") or "").strip()
+        body = it.get("body") or ""
+        if not (title.startswith(PR_TITLE_PREFIX)
+                or "Remyx Recommendation" in body):
+            continue
+        titles.append(title)
+        if len(titles) >= n:
+            break
+    return titles
+
+
+_AUDIT_PROMPT_TEMPLATE = """\
+You are auditing a candidate pool of arXiv papers for relevance gaps
+against a target code repository, and proposing 1-3 *refine queries*
+that would surface adjacent-but-missing themes from the Remyx search
+backend.
+
+The goal: catch high-value papers that the engine's normal ranking
+misses because they fall outside the repo's import graph. Typical gaps:
+the broad pool over-represents one or two stages of the pipeline while
+adjacent themes the maintainer cares about (substitutes for an imported
+model, training-recipe upgrades, alternative implementations of a
+stage) are absent despite being core to the repo's thesis.
+
+Target repo
+-----------
+__REPO_FULLNAME__
+
+Research interest the team registered
+-------------------------------------
+__INTEREST_NAME__
+
+__INTEREST_CONTEXT__
+
+Repo README excerpt (top __README_CHARS__ chars)
+------------------------------------------------
+__README__
+
+Themes Outrider has already surfaced recently (last __RECENT_N__ Issues)
+------------------------------------------------------------------------
+__RECENT_ISSUES__
+
+Broad candidate pool currently being considered (__BROAD_N__ papers)
+--------------------------------------------------------------------
+__BROAD_BRIEF__
+
+Your task
+---------
+1. Cluster the broad pool by theme. Identify themes that are
+   *over-represented* (3+ papers covering the same angle) OR that match
+   the repo's recent-Issues history (already-covered territory).
+2. Identify themes the repo's README + interest context implies the
+   maintainer cares about, but that are absent or under-represented in
+   the broad pool.
+3. For each under-represented theme that's a genuine fit, draft a single
+   keyword-style search query — 4-8 terms, no quotes, no boolean
+   operators. The Remyx /search/assets backend is keyword-matched, so
+   the strongest signal words should appear first.
+4. Output 1-3 queries (no more than 3). Quality beats quantity — if the
+   broad pool already covers everything the maintainer would care about,
+   return zero queries with a one-line reasoning. If you propose a
+   query, the reasoning must explain *what theme* it targets and *why*
+   the broad pool missed it.
+
+Output strictly this JSON object (no prose wrapper):
+{
+  "refine_queries": ["query 1", "query 2", ...],
+  "reasoning": "one paragraph explaining the audit and the queries"
+}
+"""
+
+
+def _render_broad_brief(candidates: list[Recommendation]) -> str:
+    """Compact one-line-per-candidate brief for the audit prompt.
+
+    Lighter than `_render_candidate_brief` — the audit pass works on
+    theme distribution, not per-paper verification, so we drop the long
+    reasoning bodies and keep title + arxiv + categories-or-tier.
+    """
+    lines = []
+    for i, c in enumerate(candidates):
+        abstract = " ".join((c.paper_abstract or "").split())
+        lines.append(
+            f"[{i}] {c.paper_title}  (arxiv {c.arxiv_id or 'n/a'}, "
+            f"tier {c.tier})\n"
+            f"     {abstract[:200]}"
+        )
+    return "\n".join(lines)
+
+
+def audit_and_refine_pool(
+    target: Target, broad_candidates: list[Recommendation],
+    interest_name: str, interest_context: str, experiment_history: str,
+    max_queries: int = 3,
+) -> list[Recommendation]:
+    """Run the audit pass and merge refine-query results into the pool.
+
+    Returns the deduped *combined* list (broad ∪ refine). Refine
+    candidates are appended after the broad pool — order matters for the
+    selection-pass index, and broad-ranked picks should keep their slot.
+    Dedup is on arxiv_id with version-stripped fallback to catch
+    cross-version duplicates (matches the Issue-dedup logic).
+
+    Best-effort across the board: audit failure, parse failure, refine
+    fetch failure all degrade gracefully to "just return the broad
+    pool." Never raises.
+    """
+    if len(broad_candidates) == 0:
+        return broad_candidates
+    recent_issues = _recent_outrider_issue_titles(target, n=8)
+    readme = _fetch_repo_readme(target.repo, max_chars=2000)
+    readme_block = readme or "(README unavailable)"
+    recent_block = (
+        "\n".join(f"- {t}" for t in recent_issues)
+        if recent_issues else "(no prior Outrider Issues on this repo)"
+    )
+    interest_block = (
+        interest_context.strip() or "(no interest context recorded)"
+    )
+    prompt = (
+        _AUDIT_PROMPT_TEMPLATE
+        .replace("__REPO_FULLNAME__", target.repo)
+        .replace("__INTEREST_NAME__", interest_name or "(unnamed)")
+        .replace("__INTEREST_CONTEXT__", interest_block)
+        .replace("__README_CHARS__", "2000")
+        .replace("__README__", readme_block)
+        .replace("__RECENT_N__", str(len(recent_issues)))
+        .replace("__RECENT_ISSUES__", recent_block)
+        .replace("__BROAD_N__", str(len(broad_candidates)))
+        .replace("__BROAD_BRIEF__", _render_broad_brief(broad_candidates))
+    )
+    timeout_s = int(os.environ.get("REMYX_AUDIT_TIMEOUT_S", "120"))
+    audit_max_turns = int(os.environ.get("REMYX_AUDIT_MAX_TURNS", "5"))
+    log.info(
+        f"  → audit pass over {len(broad_candidates)} broad candidates "
+        f"(timeout={timeout_s}s, max-turns={audit_max_turns}, "
+        f"recent_issues={len(recent_issues)}, "
+        f"readme={'yes' if readme else 'no'})"
+    )
+    # The audit pass is pure reasoning over inlined context — no repo
+    # navigation needed. Hand Claude an empty tempdir so the agentic
+    # loop has nothing to wander into.
+    with tempfile.TemporaryDirectory(prefix="outrider-audit-") as tmp:
+        ok, output = _run_claude_oneshot(
+            Path(tmp), prompt, timeout_s, max_turns=audit_max_turns,
+        )
+    if not ok:
+        log.warning(f"  audit call failed: {output[:200]}; "
+                    f"skipping refine pass")
+        return broad_candidates
+    data = _extract_json_object(output)
+    if data is None:
+        log.warning(f"  audit: couldn't parse JSON; raw: {output[:300]!r}")
+        return broad_candidates
+    queries = data.get("refine_queries") or []
+    if not isinstance(queries, list):
+        log.warning(f"  audit: refine_queries not a list "
+                    f"({type(queries).__name__}); skipping refine")
+        return broad_candidates
+    # Bound spend regardless of what the audit returns.
+    queries = [str(q).strip() for q in queries if str(q).strip()][:max_queries]
+    log.info(f"  audit: {len(queries)} refine quer"
+             f"{'y' if len(queries) == 1 else 'ies'}: "
+             f"{(data.get('reasoning') or '')[:160]}")
+    if not queries:
+        return broad_candidates
+    # Pre-collect existing arxiv ids (with version-stripped variants) so
+    # refine results that duplicate the broad pool are skipped silently.
+    seen: set[str] = set()
+    for c in broad_candidates:
+        if c.arxiv_id:
+            seen.add(c.arxiv_id)
+            seen.add(_arxiv_versionless(c.arxiv_id))
+    refine_recs: list[Recommendation] = []
+    per_query = int(os.environ.get("REMYX_REFINE_PER_QUERY", "5"))
+    for q in queries:
+        log.info(f"    → refine /search/assets {q!r} (max_results={per_query})")
+        assets = _remyx_search_assets(q, max_results=per_query)
+        for a in assets:
+            arxiv_id = (a.get("arxiv_id") or "").strip()
+            if not arxiv_id:
+                continue
+            if arxiv_id in seen or _arxiv_versionless(arxiv_id) in seen:
+                continue
+            seen.add(arxiv_id)
+            seen.add(_arxiv_versionless(arxiv_id))
+            refine_recs.append(_asset_to_recommendation(
+                a, refine_query=q,
+                fallback_interest_name=interest_name,
+                interest_context=interest_context,
+                experiment_history=experiment_history,
+            ))
+    log.info(f"  audit: {len(refine_recs)} new refine candidates "
+             f"after dedup (broad pool was {len(broad_candidates)})")
+    return broad_candidates + refine_recs
+
+
 def query_remyx_candidates(target: Target) -> list[Recommendation]:
     """Pull the top-N recommendations for ``target.interest_id`` over the
     configured lookback window and return them as a relevance-ranked list.
@@ -1277,11 +1618,21 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
         )
         for p in papers
     ]
-    # License + code-availability enrichment. Best-effort — any GitHub
-    # flake leaves the fields at their dataclass defaults
-    # (paper_license="", license_class="missing"/"unknown", compat=0).
-    # The opt-out is for offline/unit-test runs that shouldn't touch
-    # the network.
+    # Deep-search refine. Opt-IN: an extra Claude call + a few GitHub
+    # API calls + N /search/assets calls, so we want field observability
+    # before flipping the default. Set REMYX_DEEP_SEARCH=1 to enable.
+    if os.environ.get("REMYX_DEEP_SEARCH", "0") == "1":
+        candidates = audit_and_refine_pool(
+            target, candidates,
+            interest_name=interest_name,
+            interest_context=interest_context,
+            experiment_history=experiment_history,
+        )
+    # License + code-availability enrichment. Runs AFTER deep search so
+    # refine-pass candidates get the same license signals as broad-pass
+    # ones. Best-effort — any GitHub flake leaves the fields at their
+    # dataclass defaults. Opt-out for offline/unit tests via
+    # REMYX_LICENSE_GATE=0.
     if os.environ.get("REMYX_LICENSE_GATE", "1") != "0":
         _enrich_candidate_licenses(candidates, target)
     for i, c in enumerate(candidates):
