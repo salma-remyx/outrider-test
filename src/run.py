@@ -699,7 +699,7 @@ _PR_BODY_TEMPLATE = """\
 ## Why this paper for this team
 
 {reasoning}
-{selection_section}
+{selection_section}{license_section}
 ## Suggested experiment
 
 {suggested_experiment}
@@ -802,6 +802,24 @@ class Recommendation:
                                       # fetched from the research-interests
                                       # endpoint. Empty when the interest
                                       # has no linked history.
+    # License + code-availability gate. Populated best-effort by
+    # query_remyx_candidates after the Remyx fetch; missing data lands
+    # as empty / "unknown" / 0.0 so downstream renderers can show the
+    # red flag without blowing up the run. License compatibility is
+    # scored against the target repo's own license (fetched once per
+    # run).
+    paper_github_url: str = ""        # canonical https://github.com/owner/repo
+                                      # extracted from the Remyx resource
+                                      # envelope or scraped from paper text.
+    paper_license: str = ""           # SPDX-ish identifier as reported by
+                                      # GitHub's license endpoint
+                                      # (e.g. "Apache-2.0", "GPL-3.0",
+                                      # "CC-BY-NC-SA-4.0", "NOASSERTION").
+    license_class: str = "unknown"    # bucket — "permissive" | "copyleft" |
+                                      # "nc" | "missing" | "unknown".
+    license_compat: float = 0.0       # ∈ [0, 1] vs the target repo's
+                                      # license class; see
+                                      # _license_compat_score for the rubric.
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
@@ -974,6 +992,151 @@ def _relevance_to_tier(score: float) -> str:
     return "noise"
 
 
+# ─── License + code-availability gate ─────────────────────────────────────
+#
+# Adoption-blockers we've hit in practice: papers with no LICENSE file at
+# all, and papers with CC-BY-NC* licenses that block commercial use.
+# Both cost the maintainer real investigation time before the constraint
+# becomes visible. The gate's job is to surface that signal at
+# recommendation time — soft-scored, not hard-filtered, so a research
+# repo can still see NC papers if it wants to.
+
+_GITHUB_URL_RE = re.compile(
+    r"https?://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)"
+)
+
+# Top-level GitHub paths that look like owner names in the URL but aren't
+# repos — skip them when scraping paper text for code links.
+_GITHUB_NON_REPO_OWNERS = frozenset({
+    "orgs", "topics", "marketplace", "settings", "notifications",
+    "issues", "pulls", "explore", "trending", "features", "about",
+    "search", "login", "signup", "new", "codespaces", "sponsors",
+})
+
+# SPDX bucket classification. The lists are intentionally short — they
+# cover what we actually see on arxiv-linked repos. Anything else falls
+# through to "unknown" (visible in the report, not blocking).
+_PERMISSIVE_SPDX = frozenset({
+    "apache-2.0", "mit", "bsd-2-clause", "bsd-3-clause", "isc",
+    "0bsd", "unlicense", "wtfpl", "cc0-1.0", "cc-by-4.0", "cc-by-3.0",
+    "zlib", "boost-1.0", "bsl-1.0", "postgresql",
+})
+_COPYLEFT_SPDX = frozenset({
+    "gpl-2.0", "gpl-3.0", "agpl-3.0", "lgpl-2.1", "lgpl-3.0",
+    "mpl-2.0", "epl-2.0", "cc-by-sa-4.0", "cc-by-sa-3.0",
+})
+# CC-BY-NC and CC-BY-ND variants are the NC bucket — adoption-blocking
+# for code/model use in commercial or relicensed downstream work.
+_NC_SPDX_PREFIXES = ("cc-by-nc-", "cc-by-nd-")
+_NC_SPDX_EXACT = frozenset({"cc-by-nc-4.0", "cc-by-nd-4.0"})
+
+
+def _extract_github_urls(*texts: str) -> list[str]:
+    """Return de-duped ``owner/repo`` slugs scraped from any input text.
+
+    Looks for ``github.com/<owner>/<repo>`` substrings. Strips a trailing
+    ``.git`` and any trailing punctuation/path. Filters known-non-repo
+    owner paths (``github.com/orgs``, ``github.com/topics``, etc.).
+    Order-preserving so the first-mentioned repo (typically the paper's
+    canonical implementation) wins downstream.
+    """
+    seen: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for owner, name in _GITHUB_URL_RE.findall(text):
+            if owner.lower() in _GITHUB_NON_REPO_OWNERS:
+                continue
+            name = re.sub(r"\.git$", "", name)
+            # Strip a trailing path/fragment/query if one snuck in.
+            name = re.sub(r"[^A-Za-z0-9._-].*$", "", name)
+            if not name:
+                continue
+            slug = f"{owner}/{name}"
+            if slug not in seen:
+                seen.append(slug)
+    return seen
+
+
+def _classify_license(spdx: str) -> str:
+    """Map an SPDX-ish license id onto an adoption bucket.
+
+    Returns one of ``"permissive"``, ``"copyleft"``, ``"nc"``,
+    ``"missing"`` (no LICENSE found / empty string), or ``"unknown"``
+    (we got *something* but couldn't bucket it — e.g. an unfamiliar SPDX
+    or a custom license name). ``"missing"`` is louder than ``"unknown"``
+    because no LICENSE means no legal permission to redistribute or
+    modify at all — that's the loudest red flag we can surface.
+    """
+    lo = (spdx or "").lower().strip()
+    if not lo:
+        return "missing"
+    if lo in _PERMISSIVE_SPDX:
+        return "permissive"
+    if lo in _COPYLEFT_SPDX:
+        return "copyleft"
+    if lo in _NC_SPDX_EXACT or any(lo.startswith(p) for p in _NC_SPDX_PREFIXES):
+        return "nc"
+    return "unknown"
+
+
+def _license_compat_score(paper_class: str, target_class: str) -> float:
+    """Soft compatibility score for the paper-vs-target license pairing.
+
+    Returns a float in ``[0, 1]`` suitable for multiplicative ranking
+    (``1.0`` = adopt freely, ``0.0`` = effectively blocked). The rubric
+    is intentionally conservative against the target repo: permissive
+    targets (the common case for production code) absorb permissive
+    freely and get a yellow flag on copyleft / a red flag on NC. A
+    copyleft target absorbs both permissive and copyleft freely. Per-
+    repo overrides for the weighting are a future extension.
+    """
+    if paper_class == "permissive":
+        return 1.0
+    if paper_class == "missing":
+        return 0.0
+    if paper_class == "nc":
+        return 0.1
+    if paper_class == "copyleft":
+        # Copyleft into copyleft is fine; copyleft into a permissive
+        # target forces a re-license discussion the maintainer should
+        # see up front.
+        return 0.7 if target_class == "copyleft" else 0.5
+    return 0.5  # "unknown" — visible in the report, not silently filtered
+
+
+# Per-run cache: avoid re-hitting GitHub for the same repo across a
+# refresh + re-poll cycle. Keys are ``"owner/repo"``.
+_LICENSE_CACHE: dict[str, str] = {}
+
+
+def _fetch_repo_license(owner_repo: str) -> str:
+    """Return the SPDX-ish license id reported by GitHub, or ``""``.
+
+    Calls ``GET /repos/{owner}/{repo}/license``. ``NOASSERTION`` (GitHub
+    found a LICENSE file but couldn't classify it) collapses to ``""``
+    so the caller treats it as missing — better to flag for manual
+    review than to silently bucket it as ``"unknown"``.
+
+    Returns ``""`` on any failure (404, auth error, rate limit, network
+    flake). Never raises — license lookup must not block the pipeline.
+    """
+    if not owner_repo:
+        return ""
+    if owner_repo in _LICENSE_CACHE:
+        return _LICENSE_CACHE[owner_repo]
+    try:
+        resp = gh_api("GET", f"/repos/{owner_repo}/license")
+        spdx = ((resp.get("license") or {}).get("spdx_id") or "").strip()
+        if spdx.lower() == "noassertion":
+            spdx = ""
+    except Exception as e:
+        log.debug(f"  license fetch for {owner_repo!r} failed: {e}")
+        spdx = ""
+    _LICENSE_CACHE[owner_repo] = spdx
+    return spdx
+
+
 def _fetch_interest_context(interest_id: str) -> tuple[str, str, str]:
     """Fetch the interest's name + rich-text focus body + experiment-history
     bullets once per run.
@@ -1010,6 +1173,23 @@ def _paper_to_recommendation(
     resource = paper.get("resource") or {}
     arxiv_id = paper.get("resource_id") or resource.get("arxiv_id") or ""
     abstract = (resource.get("abstract") or resource.get("summary") or "").strip()
+    reasoning = (paper.get("reasoning") or "").strip()
+    suggested = (paper.get("suggested_experiment") or "").strip()
+    # Best-effort code-repo extraction. Check known resource keys
+    # first (cheapest signal — these are structured data when
+    # present), then fall back to scraping abstract + reasoning + the
+    # suggested experiment for a github.com URL. First hit wins.
+    paper_github_url = ""
+    for key in ("github_url", "code_url", "repo_url", "code",
+                "paperswithcode_url"):
+        v = (resource.get(key) or "").strip()
+        if v and "github.com/" in v:
+            paper_github_url = v
+            break
+    if not paper_github_url:
+        slugs = _extract_github_urls(abstract, reasoning, suggested)
+        if slugs:
+            paper_github_url = f"https://github.com/{slugs[0]}"
     return Recommendation(
         paper_title=paper.get("title") or "(untitled)",
         arxiv_id=arxiv_id,
@@ -1020,12 +1200,13 @@ def _paper_to_recommendation(
         domain_summary="",
         raw_paper_md="",
         relevance_score=relevance,
-        reasoning=(paper.get("reasoning") or "").strip(),
-        suggested_experiment=(paper.get("suggested_experiment") or "").strip(),
+        reasoning=reasoning,
+        suggested_experiment=suggested,
         recommendation_id=paper.get("recommendation_id") or "",
         interest_name=paper.get("interest_name") or fallback_interest_name,
         interest_context=interest_context,
         experiment_history=experiment_history,
+        paper_github_url=paper_github_url,
     )
 
 
@@ -1096,10 +1277,50 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
         )
         for p in papers
     ]
+    # License + code-availability enrichment. Best-effort — any GitHub
+    # flake leaves the fields at their dataclass defaults
+    # (paper_license="", license_class="missing"/"unknown", compat=0).
+    # The opt-out is for offline/unit-test runs that shouldn't touch
+    # the network.
+    if os.environ.get("REMYX_LICENSE_GATE", "1") != "0":
+        _enrich_candidate_licenses(candidates, target)
     for i, c in enumerate(candidates):
         log.info(f"    [{i}] {c.paper_title[:55]}…  "
-                 f"relevance={c.relevance_score:.2f}  tier={c.tier}")
+                 f"relevance={c.relevance_score:.2f}  tier={c.tier}  "
+                 f"license={c.paper_license or '(none)'} "
+                 f"({c.license_class}, compat={c.license_compat:.2f})")
     return candidates
+
+
+def _enrich_candidate_licenses(
+    candidates: list[Recommendation], target: Target,
+) -> None:
+    """Populate license + compat fields on each Recommendation in place.
+
+    Fetches the target repo's license once, then for each candidate with
+    a ``paper_github_url`` calls the GitHub license endpoint. Failures
+    log at debug and leave the dataclass defaults intact — the gate is
+    advisory, never blocking.
+    """
+    target_spdx = _fetch_repo_license(target.repo)
+    target_class = _classify_license(target_spdx)
+    log.info(f"  → license gate: target {target.repo!r} = "
+             f"{target_spdx or '(none)'} ({target_class})")
+    for c in candidates:
+        if not c.paper_github_url:
+            # No code link surfaced → "missing" is the right signal for
+            # a code-recommendation pipeline. Compat against missing
+            # is 0.0 by the rubric.
+            c.license_class = "missing"
+            c.license_compat = _license_compat_score("missing", target_class)
+            continue
+        slug = _extract_github_urls(c.paper_github_url)
+        if not slug:
+            continue
+        spdx = _fetch_repo_license(slug[0])
+        c.paper_license = spdx
+        c.license_class = _classify_license(spdx)
+        c.license_compat = _license_compat_score(c.license_class, target_class)
 
 
 def query_remyx_recommendation(target: Target) -> Recommendation:
@@ -1589,12 +1810,24 @@ def _render_candidate_brief(candidates: list[Recommendation]) -> str:
     blocks: list[str] = []
     for i, c in enumerate(candidates):
         abstract = " ".join((c.paper_abstract or "").split())
+        # License gate line — surfaced to the selection pass so it can
+        # weigh adoption-blocking license/code-availability signals
+        # into its choice. Omitted when no enrichment ran.
+        license_line = ""
+        if c.paper_github_url or c.paper_license or c.license_class != "unknown":
+            license_line = (
+                f"\n    code/license: "
+                f"{c.paper_github_url or '(no code link)'}  "
+                f"license={c.paper_license or '(none)'} "
+                f"({c.license_class}, compat={c.license_compat:.2f})"
+            )
         blocks.append(
             f"[{i}] {c.paper_title}  "
             f"(arxiv {c.arxiv_id or 'n/a'}, relevance {c.relevance_score:.2f}, "
             f"tier {c.tier})\n"
             f"    why surfaced: {(c.reasoning or '(none)')[:600]}\n"
             f"    abstract: {abstract[:400]}"
+            f"{license_line}"
         )
     return "\n\n".join(blocks)
 
@@ -1739,6 +1972,57 @@ def self_review_diff(
         log.warning(f"  self-review: couldn't parse JSON; raw: {output[:300]!r}")
         return None
     return data
+
+
+def _render_license_section(rec: Recommendation) -> str:
+    """Render the License & code availability block for the PR/Issue body.
+
+    Returns ``"\n"`` when no enrichment ran (every signal is at its
+    dataclass default — env opt-out or callers that bypass
+    query_remyx_candidates). Otherwise renders a short status block
+    with a class-coded emoji and a one-line note so the maintainer
+    reads it at a glance.
+    """
+    if (not rec.paper_github_url and not rec.paper_license
+            and rec.license_class in ("unknown", "")
+            and rec.license_compat == 0.0):
+        return "\n"
+    emoji = {
+        "permissive": "🟢",
+        "copyleft": "🟡",
+        "nc": "🔴",
+        "missing": "🔴",
+        "unknown": "⚪",
+    }.get(rec.license_class, "⚪")
+    note = {
+        "permissive": "Permissive license — safe to adopt.",
+        "copyleft":
+            "Copyleft license — review compatibility against this repo's "
+            "license before merging.",
+        "nc":
+            "Non-commercial / no-derivatives license — **adoption blocked** "
+            "for commercial or relicensed use.",
+        "missing":
+            "**No LICENSE file detected** — no legal permission to "
+            "redistribute or modify the code. Treat as blocking until "
+            "upstream adds a license.",
+        "unknown":
+            "Unrecognized license — manual review needed.",
+    }.get(rec.license_class, "Unrecognized license class.")
+    code_line = (
+        f"- **Code**: {rec.paper_github_url}"
+        if rec.paper_github_url else
+        "- **Code**: no repository URL surfaced in the paper or "
+        "recommendation envelope."
+    )
+    return (
+        "\n## License & code availability\n\n"
+        f"{emoji} {note}\n\n"
+        f"{code_line}\n"
+        f"- **License**: `{rec.paper_license or '(none detected)'}` "
+        f"(class: `{rec.license_class}`, compat: {rec.license_compat:.2f})\n"
+        "\n"
+    )
 
 
 def _render_self_review_section(review: dict) -> str:
@@ -2493,7 +2777,8 @@ def _open_downgrade_issue(
         f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
         f"\n---\n\n"
         f"## Why this paper is interesting for the team\n\n"
-        f"{rec.reasoning or '(no reasoning provided)'}\n\n"
+        f"{rec.reasoning or '(no reasoning provided)'}\n"
+        f"{_render_license_section(rec)}"
         f"## Suggested experiment\n\n"
         f"{rec.suggested_experiment or '(none)'}\n\n"
         f"## Why the orchestrator opened an Issue instead of a PR\n\n"
@@ -2956,6 +3241,7 @@ def process_target(target: Target) -> dict:
                 f"**Confidence**: {rec.tier} "
                 f"(Remyx relevance {rec.relevance_score:.2f})\n"
                 f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
+                f"{_render_license_section(rec)}"
                 f"\n---\n\n"
                 f"{issue_body_inner}"
             )
@@ -3220,6 +3506,7 @@ def build_pr_body(
         interest_name=rec.interest_name or "(unnamed)",
         reasoning=rec.reasoning or "(no reasoning provided)",
         selection_section=selection_section,
+        license_section=_render_license_section(rec),
         suggested_experiment=rec.suggested_experiment or "(none)",
         test_section=test_section,
         attribution_url=CANONICAL_ATTRIBUTION_URL,
