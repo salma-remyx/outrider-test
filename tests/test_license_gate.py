@@ -272,17 +272,125 @@ def test_fetch_repo_license_caches(monkeypatch):
     assert hits["n"] == 1
 
 
-def test_fetch_repo_license_collapses_noassertion(monkeypatch):
-    """GitHub's NOASSERTION (unparseable LICENSE) should become "" so the
-    downstream classifier flags it as missing — better to ask for human
-    review than to silently bucket it as unknown."""
+def test_fetch_repo_license_noassertion_with_unrecognized_content_stays_noassertion(monkeypatch):
+    """NOASSERTION from GitHub with a LICENSE file the sniffer can't
+    classify should land as "NOASSERTION" so the upstream classifier
+    buckets it as "unknown" (yellow flag) — never as "missing" (red
+    flag, reserved for "no LICENSE file at all")."""
+    import base64 as _b64
+    custom_text = _b64.b64encode(b"My fully custom academic license\n"
+                                 b"No standard FOSS/CC fingerprints here.").decode()
     def fake_gh_api(method, path, body=None):
-        return {"license": {"spdx_id": "NOASSERTION"}}
+        return {
+            "license": {"spdx_id": "NOASSERTION"},
+            "content": custom_text, "encoding": "base64",
+        }
 
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
     monkeypatch.setattr(run, "_LICENSE_CACHE", {})
 
-    assert run._fetch_repo_license("foo/bar") == ""
+    assert run._fetch_repo_license("foo/bar") == "NOASSERTION"
+    assert run._classify_license("NOASSERTION") == "unknown"
+
+
+def test_fetch_repo_license_sniffs_cc_by_nc_when_github_punts(monkeypatch):
+    """The headline regression case from the v1.3.8 ship:
+    UniDepth (lpiccinelli-eth/UniDepth) is CC-BY-NC-4.0 but GitHub's
+    classifier returns NOASSERTION. The sniffer must catch this so
+    the gate flags the NC restriction instead of silently reporting
+    "missing"."""
+    import base64 as _b64
+    cc_by_nc = _b64.b64encode(
+        b"Attribution-NonCommercial 4.0 International\n\n"
+        b"Creative Commons Corporation ...\n"
+    ).decode()
+    def fake_gh_api(method, path, body=None):
+        return {
+            "license": {"spdx_id": "NOASSERTION"},
+            "content": cc_by_nc, "encoding": "base64",
+        }
+
+    monkeypatch.setattr(run, "gh_api", fake_gh_api)
+    monkeypatch.setattr(run, "_LICENSE_CACHE", {})
+
+    spdx = run._fetch_repo_license("foo/bar")
+    assert spdx == "CC-BY-NC-4.0"
+    assert run._classify_license(spdx) == "nc"
+
+
+def test_sniff_license_from_content_creative_commons_variants():
+    """The full Creative Commons matrix is the headline case for the
+    sniffer. NC > NC-SA > NC-ND priority ordering must not collapse
+    composites into the simpler parent class."""
+    import base64 as _b64
+
+    def b64(text: str) -> str:
+        return _b64.b64encode(text.encode()).decode()
+
+    cases = [
+        ("Attribution-NonCommercial-ShareAlike 4.0", "CC-BY-NC-SA-4.0"),
+        ("Attribution-NonCommercial-ShareAlike 3.0", "CC-BY-NC-SA-3.0"),
+        ("Attribution-NonCommercial-NoDerivatives 4.0", "CC-BY-NC-ND-4.0"),
+        ("Attribution-NonCommercial 4.0", "CC-BY-NC-4.0"),
+        ("Attribution-NoDerivatives 4.0", "CC-BY-ND-4.0"),
+        ("Attribution-ShareAlike 4.0", "CC-BY-SA-4.0"),
+        ("Attribution 4.0 International", "CC-BY-4.0"),
+    ]
+    for needle, expected_spdx in cases:
+        content = b64(f"{needle}\n\nCreative Commons preamble ...")
+        assert run._sniff_license_from_content(content) == expected_spdx, needle
+
+
+def test_sniff_license_from_content_standard_foss_licenses():
+    import base64 as _b64
+
+    def b64(text: str) -> str:
+        return _b64.b64encode(text.encode()).decode()
+
+    assert run._sniff_license_from_content(
+        b64("Apache License\nVersion 2.0, January 2004\n...")
+    ) == "Apache-2.0"
+    assert run._sniff_license_from_content(
+        b64("MIT License\n\nPermission is hereby granted, "
+            "free of charge, to any person ...")
+    ) == "MIT"
+    assert run._sniff_license_from_content(
+        b64("BSD 3-Clause License\n\nRedistribution and use in source "
+            "and binary forms, with or without modification, ...")
+    ) == "BSD-3-Clause"
+    assert run._sniff_license_from_content(
+        b64("GNU GENERAL PUBLIC LICENSE\nVersion 3 ...")
+    ) == "GPL-3.0"
+    assert run._sniff_license_from_content(
+        b64("GNU AFFERO GENERAL PUBLIC LICENSE\nVersion 3 ...")
+    ) == "AGPL-3.0"
+    assert run._sniff_license_from_content(
+        b64("Mozilla Public License Version 2.0 ...")
+    ) == "MPL-2.0"
+
+
+def test_sniff_license_from_content_returns_empty_on_no_match():
+    import base64 as _b64
+    custom = _b64.b64encode(
+        b"Proprietary research license, all rights reserved.\n"
+        b"Contact the authors for terms."
+    ).decode()
+    assert run._sniff_license_from_content(custom) == ""
+
+
+def test_sniff_license_from_content_handles_empty_and_invalid_safely():
+    assert run._sniff_license_from_content("") == ""
+    assert run._sniff_license_from_content("not-valid-base64!@#$") == ""
+
+
+def test_sniff_license_from_content_prefers_specific_over_general():
+    """NC-SA contains both 'NonCommercial' and 'ShareAlike' substrings;
+    must match NC-SA not plain NC or plain SA."""
+    import base64 as _b64
+    content = _b64.b64encode(
+        b"Attribution-NonCommercial-ShareAlike 4.0 International"
+    ).decode()
+    assert run._sniff_license_from_content(content) == "CC-BY-NC-SA-4.0"
 
 
 def test_fetch_repo_license_swallows_errors(monkeypatch):

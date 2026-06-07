@@ -1106,21 +1106,93 @@ def _license_compat_score(paper_class: str, target_class: str) -> float:
     return 0.5  # "unknown" — visible in the report, not silently filtered
 
 
+# Substring fingerprints for content-sniffing LICENSE files when GitHub's
+# classifier punts to NOASSERTION. Ordered by specificity (longer / more
+# specific keys come first so e.g. NC-SA isn't shadowed by plain NC). The
+# CC variants are the headline case: GitHub's classifier returns
+# NOASSERTION for every Creative Commons license that isn't an exact
+# match against its pattern set, which means CC-BY-NC / CC-BY-NC-SA /
+# CC-BY-ND repos silently get classified as "missing" — the inverse of
+# what the gate is meant to surface.
+_LICENSE_CONTENT_FINGERPRINTS: tuple[tuple[str, str], ...] = (
+    # CC-BY-NC-SA variants (NC + ShareAlike). Check before plain NC.
+    ("Attribution-NonCommercial-ShareAlike 4.0", "CC-BY-NC-SA-4.0"),
+    ("Attribution-NonCommercial-ShareAlike 3.0", "CC-BY-NC-SA-3.0"),
+    # CC-BY-NC-ND (NC + NoDerivatives). Check before plain NC and ND.
+    ("Attribution-NonCommercial-NoDerivatives 4.0", "CC-BY-NC-ND-4.0"),
+    # CC-BY-NC alone.
+    ("Attribution-NonCommercial 4.0", "CC-BY-NC-4.0"),
+    ("Attribution-NonCommercial 3.0", "CC-BY-NC-3.0"),
+    # CC-BY-ND alone.
+    ("Attribution-NoDerivatives 4.0", "CC-BY-ND-4.0"),
+    # CC-BY-SA (copyleft).
+    ("Attribution-ShareAlike 4.0", "CC-BY-SA-4.0"),
+    ("Attribution-ShareAlike 3.0", "CC-BY-SA-3.0"),
+    # CC-BY alone (permissive).
+    ("Attribution 4.0 International", "CC-BY-4.0"),
+    # Standard FOSS licenses GitHub usually catches, but listed here for
+    # the edge cases (custom header, multi-license LICENSE files where
+    # GitHub punts but the body still includes the canonical text).
+    ("Apache License", "Apache-2.0"),
+    ("GNU AFFERO GENERAL PUBLIC LICENSE", "AGPL-3.0"),
+    ("GNU LESSER GENERAL PUBLIC LICENSE", "LGPL-3.0"),
+    ("GNU GENERAL PUBLIC LICENSE", "GPL-3.0"),
+    ("Mozilla Public License", "MPL-2.0"),
+    ("Permission is hereby granted, free of charge", "MIT"),
+    ("Redistribution and use in source and binary forms", "BSD-3-Clause"),
+)
+
+
+def _sniff_license_from_content(b64_content: str) -> str:
+    """Best-effort SPDX classification from raw LICENSE file content.
+
+    Decodes ``b64_content`` (GitHub's `/license` endpoint returns the
+    LICENSE file as base64) and looks for distinctive substrings within
+    the first 2KB. Returns the matched SPDX id, or ``""`` if nothing
+    matched. The 2KB window covers every license preamble we care about
+    and bounds CPU on multi-MB LICENSE files (yes, those exist).
+
+    Order matters: NC-SA / NC-ND / NC are checked before SA / ND so
+    Creative Commons composites aren't mis-classified as their less-
+    restrictive cousins.
+    """
+    if not b64_content:
+        return ""
+    try:
+        decoded = base64.b64decode(b64_content).decode(
+            "utf-8", errors="replace"
+        )
+    except Exception:
+        return ""
+    head = decoded[:2048]
+    for needle, spdx in _LICENSE_CONTENT_FINGERPRINTS:
+        if needle in head:
+            return spdx
+    return ""
+
+
 # Per-run cache: avoid re-hitting GitHub for the same repo across a
 # refresh + re-poll cycle. Keys are ``"owner/repo"``.
 _LICENSE_CACHE: dict[str, str] = {}
 
 
 def _fetch_repo_license(owner_repo: str) -> str:
-    """Return the SPDX-ish license id reported by GitHub, or ``""``.
+    """Return the SPDX-ish license id for ``owner_repo``, or ``""``.
 
-    Calls ``GET /repos/{owner}/{repo}/license``. ``NOASSERTION`` (GitHub
-    found a LICENSE file but couldn't classify it) collapses to ``""``
-    so the caller treats it as missing — better to flag for manual
-    review than to silently bucket it as ``"unknown"``.
+    Calls ``GET /repos/{owner}/{repo}/license``. When GitHub finds a
+    LICENSE file but its classifier returns ``NOASSERTION`` — which
+    happens for every Creative Commons license (CC-BY-NC*, CC-BY-ND*,
+    CC-BY-SA, CC-BY) and a long tail of custom academic / research
+    licenses — fall back to content-sniffing the file body for a
+    distinctive substring before giving up. If neither GitHub's
+    classifier nor the sniffer matches, return ``"NOASSERTION"`` so the
+    upstream classifier buckets the result as ``"unknown"`` (yellow
+    flag) rather than ``"missing"`` (red flag, reserved for "no LICENSE
+    file at all").
 
-    Returns ``""`` on any failure (404, auth error, rate limit, network
-    flake). Never raises — license lookup must not block the pipeline.
+    Returns ``""`` only on real fetch failure (404, auth error, rate
+    limit, network flake). Never raises — license lookup must not block
+    the pipeline.
     """
     if not owner_repo:
         return ""
@@ -1130,7 +1202,8 @@ def _fetch_repo_license(owner_repo: str) -> str:
         resp = gh_api("GET", f"/repos/{owner_repo}/license")
         spdx = ((resp.get("license") or {}).get("spdx_id") or "").strip()
         if spdx.lower() == "noassertion":
-            spdx = ""
+            sniffed = _sniff_license_from_content(resp.get("content") or "")
+            spdx = sniffed if sniffed else "NOASSERTION"
     except Exception as e:
         log.debug(f"  license fetch for {owner_repo!r} failed: {e}")
         spdx = ""
