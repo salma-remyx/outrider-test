@@ -5163,6 +5163,29 @@ def _write_step_summary(result: dict) -> None:
                 f"re-validated this run).\n"
             )
 
+    # Selection-pass narrative — "why this candidate (or skip)" from
+    # the agentic selection. Distinct from rec.reasoning, which is the
+    # per-paper context. For skipped_by_selection_verification there is
+    # no paper at all and selection_reasoning is the only meaningful
+    # payload — render it open so it's visible without expansion. For
+    # other outcomes, collapse it so the cost line stays above the
+    # fold. The "(selection pass unavailable — used highest-relevance
+    # candidate as fallback)" placeholder is a non-signal and is
+    # skipped here.
+    selection_reasoning = (result.get("selection_reasoning") or "").strip()
+    if (
+        selection_reasoning
+        and not selection_reasoning.startswith("(selection pass unavailable")
+    ):
+        open_attr = (
+            " open" if status == "skipped_by_selection_verification" else ""
+        )
+        lines.append(
+            f"<details{open_attr}><summary>Why this selection</summary>\n"
+        )
+        lines.append(f"\n{selection_reasoning}\n")
+        lines.append("\n</details>\n")
+
     if reasoning:
         # Collapse long reasoning into a <details> so the cost line
         # stays above the fold.
