@@ -597,8 +597,12 @@ poor structural fits, broaden the search:
 When the broader catalog surfaces a candidate that satisfies one of the
 three integration shapes — especially when a maintainer thread (an open
 Issue, an active PR discussion) names a specific paper that the pool
-doesn't contain — you MAY return it as an **out-of-pool pick** using
-the extended schema below (`chosen_index: -2`).
+doesn't contain AND the paper is not already in the "Already filed by
+Outrider" section above — you MAY return it as an **out-of-pool pick**
+using the extended schema below (`chosen_index: -2`). Papers in the
+discharged set have already been put in front of the maintainer and
+must not be re-picked here, in-pool or out — selecting one wastes the
+selection-pass budget and the dedup gate would skip it anyway.
 
 The verification bar for out-of-pool picks is STRICTER than for
 in-pool: the search result must explicitly match the contract the
@@ -678,7 +682,7 @@ fences, no prose before or after. Schema:
   ]
 }
 
---- Candidates (highest relevance first) ---
+__DISCHARGED_PAPERS__--- Candidates (highest relevance first) ---
 
 __CANDIDATES__
 
@@ -2732,10 +2736,126 @@ def preflight_routing(
     return data
 
 
-def _render_candidate_brief(candidates: list[Recommendation]) -> str:
+_ARXIV_ABS_RE = re.compile(
+    r"arxiv\.org/abs/(\d{4}\.\d{4,6})(v\d+)?", re.IGNORECASE,
+)
+
+
+def _arxiv_id_from_issue_body(body: str) -> str | None:
+    """Pull the first ``arxiv.org/abs/<id>`` reference from an Issue body
+    and return the versionless id. Returns None when no arxiv reference
+    is present (e.g. OPEN_AS_ISSUE downgrades whose title is Claude-
+    authored).
+    """
+    if not body:
+        return None
+    m = _ARXIV_ABS_RE.search(body)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _discharged_index(issues: list[dict]) -> dict[str, dict]:
+    """Build an arxiv-id -> {issue_number, state, title} index from the
+    all-state prior-Outrider-Issues set. Used by both the discharge-set
+    prompt section and the in-pool candidate annotation. Keyed on the
+    versionless arxiv id so a candidate at 2605.26102v3 matches an Issue
+    that linked 2605.26102v1.
+    """
+    out: dict[str, dict] = {}
+    for it in issues:
+        body = it.get("body") or ""
+        arxiv = _arxiv_id_from_issue_body(body)
+        if not arxiv:
+            continue
+        # First write wins — issues are ordered most-recent-first by
+        # GitHub default, so the freshest reference for a paper takes
+        # precedence when duplicates exist.
+        if arxiv in out:
+            continue
+        out[arxiv] = {
+            "number": it.get("number"),
+            "state": it.get("state") or "open",
+            "title": it.get("title") or "",
+        }
+    return out
+
+
+def _render_discharged_papers(issues: list[dict], cap: int = 50) -> str:
+    """Render the "Already filed by Outrider" section for the selection
+    prompt. Returns ``""`` when no Outrider Issues exist for the target
+    so the template stays byte-stable for new installs and customers with
+    no prior recommendations.
+
+    The cap bounds prompt size for long-tail customers — we keep the
+    most-recent N entries. Issues arrive most-recent-first from the
+    GitHub /issues endpoint, so a simple slice preserves recency.
+    """
+    if not issues:
+        return ""
+    capped = issues[:cap]
+    bullets: list[str] = []
+    truncated_arxiv_ids: set[str] = set()
+    for it in capped:
+        body = it.get("body") or ""
+        arxiv = _arxiv_id_from_issue_body(body)
+        if not arxiv:
+            continue
+        if arxiv in truncated_arxiv_ids:
+            continue
+        truncated_arxiv_ids.add(arxiv)
+        number = it.get("number") or "?"
+        state = it.get("state") or "open"
+        title = (it.get("title") or "").strip()
+        # Strip the standard "[Remyx Recommendation] " prefix for
+        # readability — the section header already carries that context.
+        if title.startswith(PR_TITLE_PREFIX + " "):
+            title = title[len(PR_TITLE_PREFIX) + 1:]
+        if len(title) > 80:
+            title = title[:77] + "…"
+        bullets.append(
+            f"- arxiv {arxiv} — \"{title}\" — Issue #{number} ({state})"
+        )
+    if not bullets:
+        return ""
+    skipped = max(0, len(issues) - len(capped))
+    footer = (
+        f"\n…and {skipped} older Issue(s) omitted from this list."
+        if skipped else ""
+    )
+    return (
+        "--- Already filed by Outrider for this repository "
+        "(do NOT re-pick) ---\n"
+        "\n"
+        "These papers have an existing Outrider Issue — open means still in\n"
+        "flight, closed means the team has made a call. Either way the\n"
+        "maintainer has already been told. Selecting one of these (in-pool\n"
+        "or out-of-pool) would just re-confirm what's already on record.\n"
+        "Skip them. If you believe one should be revisited, the lever is\n"
+        "for the maintainer to reopen the Issue — not for selection to\n"
+        "re-pick.\n"
+        "\n"
+        + "\n".join(bullets)
+        + footer
+        + "\n\n"
+    )
+
+
+def _render_candidate_brief(
+    candidates: list[Recommendation],
+    discharged: dict[str, dict] | None = None,
+) -> str:
     """Numbered, relevance-ranked brief of the candidate pool for the
     selection pass. Index matches list position so the model's
-    ``chosen_index`` maps straight back."""
+    ``chosen_index`` maps straight back.
+
+    When ``discharged`` is provided (arxiv-id -> {number, state, title}
+    from the prior-Outrider-Issues set), candidates whose arxiv id
+    matches an entry carry an inline ``✗ already filed: #NN (state)``
+    annotation so the dedup state is visible inside the candidate brief
+    itself, not just the standalone discharge section.
+    """
+    discharged = discharged or {}
     blocks: list[str] = []
     for i, c in enumerate(candidates):
         abstract = " ".join((c.paper_abstract or "").split())
@@ -2765,10 +2885,23 @@ def _render_candidate_brief(candidates: list[Recommendation]) -> str:
         family_line = (
             f"\n    family: {c.family_summary}" if c.family_summary else ""
         )
+        # Discharge annotation. When the candidate's arxiv id matches a
+        # prior Outrider Issue, surface the Issue # and state inline so
+        # the LLM sees the dedup signal next to the candidate it's
+        # weighing — not just in the section above.
+        discharged_suffix = ""
+        if c.arxiv_id:
+            versionless = _arxiv_versionless(c.arxiv_id) or c.arxiv_id
+            entry = discharged.get(versionless) or discharged.get(c.arxiv_id)
+            if entry:
+                discharged_suffix = (
+                    f"  ✗ already filed: Issue #{entry['number']} "
+                    f"({entry['state']}) — do NOT pick"
+                )
         blocks.append(
             f"[{i}] {c.paper_title}  "
             f"(arxiv {c.arxiv_id or 'n/a'}, relevance {c.relevance_score:.2f}, "
-            f"tier {c.tier}){family_line}\n"
+            f"tier {c.tier}){discharged_suffix}{family_line}\n"
             f"    why surfaced: {(c.reasoning or '(none)')[:600]}\n"
             f"    abstract: {abstract[:400]}"
             f"{license_line}"
@@ -2780,6 +2913,7 @@ def select_recommendation(
     workdir: Path, package: str, candidates: list[Recommendation],
     target: "Target | None" = None,
     timeout_s: int | None = None,
+    discharged_issues: list[dict] | None = None,
 ) -> dict | None:
     """Claude pass that picks the most implementable candidate from the
     lookback pool, given the target repo's module layout.
@@ -2801,10 +2935,19 @@ def select_recommendation(
         return None
     layout = _repo_layout_manifest(workdir, package)
     repo_fullname = target.repo if target is not None else "<unknown>"
+    issues = discharged_issues or []
+    discharged_index = _discharged_index(issues)
     prompt = (
         _SELECTION_PROMPT_TEMPLATE
         .replace("__REPO_FULLNAME__", repo_fullname)
-        .replace("__CANDIDATES__", _render_candidate_brief(candidates))
+        .replace(
+            "__DISCHARGED_PAPERS__",
+            _render_discharged_papers(issues),
+        )
+        .replace(
+            "__CANDIDATES__",
+            _render_candidate_brief(candidates, discharged=discharged_index),
+        )
         .replace("__LAYOUT__", layout)
     )
     # Bound the agentic flow — selection is verification, not a full
@@ -4224,7 +4367,10 @@ def process_target(target: Target) -> dict:
             )
             log.info(f"  ✓ pinned candidate [{pinned_idx}] {rec.paper_title[:50]}…")
         else:
-            selection = select_recommendation(workdir, package, viable, target=target)
+            selection = select_recommendation(
+                workdir, package, viable, target=target,
+                discharged_issues=open_issues,
+            )
             if selection is not None and selection.get("chosen_index") == -1:
                 # Agentic selection rejected every candidate after verification.
                 # The honest signal is "skip this run" — not "fall back to the
