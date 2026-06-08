@@ -540,6 +540,29 @@ substitution does. Stein-Encoder is NOT a replacement for SteinVI even
 though both invoke "Stein's method" — the I/O contracts are different
 problem classes.
 
+**Tie-break — when implementability is comparable, prefer
+simplification > replacement > addition.** A paper that lets the
+maintainer simplify, accelerate, or replace an existing stage tends
+to produce deeper engagement than a paper that adds a parallel
+feature, all else equal. Reasons:
+
+  - The repo's existing contracts are already in production. A
+    proposal anchored on one of those contracts carries leverage that
+    a net-new module doesn't — the maintainer doesn't have to decide
+    "is this worth integrating at all" because the contract is
+    already worth integrating.
+  - Simplification proposals tend to ship as deliberation Issues
+    (phased rollout, fallback paths, when-to-revisit thresholds)
+    that preserve value even when not adopted as PRs.
+  - Net-new add-alongside picks correlate with PRs that go stale or
+    get rejected because the repo's actual call sites don't need them.
+
+When two candidates score similarly on the verification bar, favor
+the one that touches more existing call sites — even if its surface
+relevance is lower. An add-alongside pick is still legitimate when
+the broad pool genuinely lacks contract-anchored candidates; just
+don't prefer it by default.
+
 If after verification the pre-fetched candidates all turn out to be
 poor structural fits, broaden the search:
   - `remyxai search query "<technique_or_paper_name>"` — search the
@@ -1481,15 +1504,30 @@ Your task
 2. Identify themes the repo's README + interest context implies the
    maintainer cares about, but that are absent or under-represented in
    the broad pool.
-3. For each under-represented theme that's a genuine fit, draft a single
+3. **Bias your refine queries toward SIMPLIFY / REPLACE / ACCELERATE
+   angles over ADD-ALONGSIDE angles.** Look specifically for:
+     - Two-model or multi-step pipeline stages that could become one
+     - Imported foundation models that have published successors
+     - Multi-step processes the repo runs that could become single-pass
+     - Libraries the repo depends on that could be retired
+     - Stages where the imported model's claim (speedup, accuracy)
+       could be empirically validated against the repo's typical scale
+   Ask "what could SIMPLIFY or REPLACE stage X in this repo?" before
+   asking "what's ADJACENT to X?". An add-alongside query is acceptable
+   only when the README or interest context explicitly names a missing
+   capability — otherwise the repo's existing contracts already
+   represent the highest-leverage surfaces to improve.
+4. For each under-represented theme that's a genuine fit, draft a single
    keyword-style search query — 4-8 terms, no quotes, no boolean
    operators. The Remyx /search/assets backend is keyword-matched, so
    the strongest signal words should appear first.
-4. Output 1-3 queries (no more than 3). Quality beats quantity — if the
+5. Output 1-3 queries (no more than 3). Quality beats quantity — if the
    broad pool already covers everything the maintainer would care about,
    return zero queries with a one-line reasoning. If you propose a
-   query, the reasoning must explain *what theme* it targets and *why*
-   the broad pool missed it.
+   query, the reasoning must explain *what theme* it targets, *why* the
+   broad pool missed it, and which existing repo contract it anchors on
+   (or call out explicitly that it's an add-alongside justified by an
+   explicit README/interest signal).
 
 Output strictly this JSON object (no prose wrapper):
 {
