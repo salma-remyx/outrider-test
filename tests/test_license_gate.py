@@ -208,6 +208,11 @@ def test_enrich_candidates_populates_fields_and_compat(monkeypatch):
 
     monkeypatch.setattr(run, "gh_api", fake_gh_api)
     monkeypatch.setattr(run, "_LICENSE_CACHE", {})
+    # Block the arxiv-page fallback so the NoCodePaper case doesn't hit
+    # the network during a unit test.
+    monkeypatch.setattr(
+        run, "_fetch_arxiv_abstract_page_urls", lambda arxiv_id: ([], []),
+    )
 
     target = Target(repo="example/target-repo", interest_id="iid")
     candidates = [
@@ -246,9 +251,11 @@ def test_enrich_candidates_populates_fields_and_compat(monkeypatch):
     assert candidates[1].license_class == "missing"
     assert candidates[1].license_compat == 0.0
 
-    # No URL at all → straight to "missing".
-    assert candidates[2].license_class == "missing"
-    assert candidates[2].license_compat == 0.0
+    # No URL at all (after arxiv-page fallback also produced nothing) →
+    # "no-code-link" (yellow flag), distinct from "missing" (red flag,
+    # reserved for "we did fetch a LICENSE endpoint and got nothing").
+    assert candidates[2].license_class == "no-code-link"
+    assert candidates[2].license_compat == 0.3
 
     # Target license was fetched exactly once (cached).
     assert calls.count("/repos/example/target-repo/license") == 1

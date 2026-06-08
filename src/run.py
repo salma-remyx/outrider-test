@@ -834,16 +834,48 @@ class Recommendation:
     # run).
     paper_github_url: str = ""        # canonical https://github.com/owner/repo
                                       # extracted from the Remyx resource
-                                      # envelope or scraped from paper text.
+                                      # envelope, scraped from paper text,
+                                      # or pulled from the arxiv abstract
+                                      # page as a final fallback.
+    paper_huggingface_url: str = ""   # canonical
+                                      # https://huggingface.co/owner/model
+                                      # extracted from the same sources.
+                                      # When present, the HF Hub model-card
+                                      # frontmatter is the authoritative
+                                      # license source (preferred over the
+                                      # GitHub LICENSE classifier output)
+                                      # because it describes the *weights*
+                                      # a customer would actually load.
     paper_license: str = ""           # SPDX-ish identifier as reported by
-                                      # GitHub's license endpoint
-                                      # (e.g. "Apache-2.0", "GPL-3.0",
-                                      # "CC-BY-NC-SA-4.0", "NOASSERTION").
+                                      # the most authoritative source
+                                      # available (HF model card > GitHub
+                                      # LICENSE). Examples: "Apache-2.0",
+                                      # "GPL-3.0", "CC-BY-NC-SA-4.0",
+                                      # "NOASSERTION".
+    license_source: str = ""          # which signal produced ``paper_license``
+                                      # — "huggingface" | "github" |
+                                      # "github_content_sniff" | "" (none).
+                                      # Used by the renderer + log for
+                                      # provenance and by mismatch-detection
+                                      # when both HF and GitHub disagree.
     license_class: str = "unknown"    # bucket — "permissive" | "copyleft" |
-                                      # "nc" | "missing" | "unknown".
+                                      # "nc" | "missing" | "no-code-link" |
+                                      # "unknown". The "no-code-link" class
+                                      # is distinct from "missing": the
+                                      # former means we couldn't find any
+                                      # code repo URL to inspect, the latter
+                                      # means we *did* fetch and got nothing
+                                      # parseable — different signal for
+                                      # the maintainer.
     license_compat: float = 0.0       # ∈ [0, 1] vs the target repo's
                                       # license class; see
                                       # _license_compat_score for the rubric.
+    family_summary: str = ""          # When candidates that share the same
+                                      # code repo are coalesced (paper-version
+                                      # families: one repo, multiple arxiv
+                                      # releases), the representative carries
+                                      # a human-readable summary of the
+                                      # siblings. Empty for solo candidates.
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────
@@ -1028,6 +1060,9 @@ def _relevance_to_tier(score: float) -> str:
 _GITHUB_URL_RE = re.compile(
     r"https?://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)"
 )
+_HUGGINGFACE_URL_RE = re.compile(
+    r"https?://huggingface\.co/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)"
+)
 
 # Top-level GitHub paths that look like owner names in the URL but aren't
 # repos — skip them when scraping paper text for code links.
@@ -1035,6 +1070,15 @@ _GITHUB_NON_REPO_OWNERS = frozenset({
     "orgs", "topics", "marketplace", "settings", "notifications",
     "issues", "pulls", "explore", "trending", "features", "about",
     "search", "login", "signup", "new", "codespaces", "sponsors",
+})
+
+# HuggingFace top-level paths that aren't model owners — same idea, the
+# regex catches any /<word>/<word> shape, so we filter the platform
+# pages out before treating the URL as an owner/model slug.
+_HUGGINGFACE_NON_MODEL_OWNERS = frozenset({
+    "spaces", "datasets", "docs", "blog", "join", "login", "settings",
+    "pricing", "tasks", "papers", "models", "search", "new",
+    "api", "chat", "huggingchat",
 })
 
 # SPDX bucket classification. The lists are intentionally short — they
@@ -1082,6 +1126,85 @@ def _extract_github_urls(*texts: str) -> list[str]:
     return seen
 
 
+def _extract_huggingface_urls(*texts: str) -> list[str]:
+    """Return de-duped ``owner/model`` slugs from any input text.
+
+    Parallel to ``_extract_github_urls`` but for HuggingFace Hub model
+    URLs. Filters platform-page paths (``huggingface.co/spaces``,
+    ``huggingface.co/datasets``, etc.) that share the ``<word>/<word>``
+    shape but aren't model identifiers.
+
+    Note: HF Hub also hosts datasets and Spaces; this function targets
+    *models* (the most common adoption surface for a paper's code).
+    A future extension could add a separate dataset extractor when the
+    license gate grows to cover dataset licensing too.
+    """
+    seen: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for owner, name in _HUGGINGFACE_URL_RE.findall(text):
+            if owner.lower() in _HUGGINGFACE_NON_MODEL_OWNERS:
+                continue
+            name = re.sub(r"[^A-Za-z0-9._-].*$", "", name)
+            # Trailing sentence punctuation can land inside the regex
+            # match (the dot/underscore/hyphen char class is permissive)
+            # — strip it so a URL that ends a sentence still resolves.
+            name = name.rstrip(".,;:!?-_")
+            if not name:
+                continue
+            slug = f"{owner}/{name}"
+            if slug not in seen:
+                seen.append(slug)
+    return seen
+
+
+# Per-process cache for arxiv abstract-page scrapes. Arxiv abstract
+# pages are essentially static within a run, so one fetch per id is
+# enough. Key: arxiv_id (with or without version suffix); value: a tuple
+# ``(github_slugs, hf_slugs)`` extracted from the page HTML.
+_ARXIV_PAGE_CACHE: dict[str, tuple[list[str], list[str]]] = {}
+
+
+def _fetch_arxiv_abstract_page_urls(arxiv_id: str) -> tuple[list[str], list[str]]:
+    """Best-effort fallback for candidates where the Remyx envelope and
+    paper-text scrape didn't surface code/model URLs.
+
+    Most arxiv papers list the canonical implementation URL on the
+    abstract page — either in the author-supplied abstract (a "Code:"
+    line), in the "Other formats" / "Code, Data, Media" sidebar, or via
+    paperswithcode integration. We pull the page HTML and run the same
+    GitHub + HF extractors over it.
+
+    Returns ``(github_slugs, hf_slugs)``; either or both may be empty.
+    Never raises — license enrichment must stay best-effort.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return [], []
+    if arxiv_id in _ARXIV_PAGE_CACHE:
+        return _ARXIV_PAGE_CACHE[arxiv_id]
+    url = f"https://arxiv.org/abs/{arxiv_id}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "feature-finder-orchestrator",
+                "Accept": "text/html",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"  arxiv page fetch for {arxiv_id} failed: {e}")
+        _ARXIV_PAGE_CACHE[arxiv_id] = ([], [])
+        return [], []
+    gh = _extract_github_urls(html)
+    hf = _extract_huggingface_urls(html)
+    _ARXIV_PAGE_CACHE[arxiv_id] = (gh, hf)
+    return gh, hf
+
+
 def _classify_license(spdx: str) -> str:
     """Map an SPDX-ish license id onto an adoption bucket.
 
@@ -1126,6 +1249,14 @@ def _license_compat_score(paper_class: str, target_class: str) -> float:
         # target forces a re-license discussion the maintainer should
         # see up front.
         return 0.7 if target_class == "copyleft" else 0.5
+    if paper_class == "no-code-link":
+        # We couldn't find a code URL to inspect. That's a yellow flag,
+        # not a red one — distinct from "missing" (which means we *did*
+        # fetch a LICENSE endpoint and got nothing parseable). Score
+        # below "unknown" since the maintainer has less information,
+        # but above "missing" since there's no positive assertion of
+        # "no permission granted."
+        return 0.3
     return 0.5  # "unknown" — visible in the report, not silently filtered
 
 
@@ -1197,6 +1328,64 @@ def _sniff_license_from_content(b64_content: str) -> str:
 # Per-run cache: avoid re-hitting GitHub for the same repo across a
 # refresh + re-poll cycle. Keys are ``"owner/repo"``.
 _LICENSE_CACHE: dict[str, str] = {}
+
+# Per-run cache for HF model-card license lookups. Keys are
+# ``"owner/model"``; values are SPDX-ish strings (or "" on miss).
+_HF_LICENSE_CACHE: dict[str, str] = {}
+
+
+def _fetch_hf_license(owner_model: str) -> str:
+    """Return the SPDX-ish license id for an HF Hub model, or ``""``.
+
+    Calls ``GET https://huggingface.co/api/models/{owner}/{model}`` —
+    the model-card metadata endpoint. HF returns a JSON envelope whose
+    ``cardData.license`` field carries the license declared in the
+    model card's YAML frontmatter. This is the **authoritative** source
+    for *weight* licensing: it describes what a customer actually loads
+    with ``AutoModel.from_pretrained(...)``, which is what the gate
+    cares about.
+
+    The HF Hub API is unauthenticated for public models — no token
+    required. Returns ``""`` on any failure (404, network flake, missing
+    license field) so the caller can degrade silently to the GitHub
+    license result. Never raises.
+
+    SPDX value normalization: HF allows free-text license strings as
+    well as SPDX ids. We surface the raw value here and let
+    ``_classify_license`` bucket it; the existing CC-prefix matchers
+    cover the common free-text variants (``cc-by-nc-4.0`` and friends).
+    """
+    if not owner_model:
+        return ""
+    if owner_model in _HF_LICENSE_CACHE:
+        return _HF_LICENSE_CACHE[owner_model]
+    url = f"https://huggingface.co/api/models/{owner_model}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "feature-finder-orchestrator",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        log.debug(f"  HF license fetch for {owner_model!r} failed: {e}")
+        _HF_LICENSE_CACHE[owner_model] = ""
+        return ""
+    card = data.get("cardData") or {}
+    raw = card.get("license")
+    # HF allows the license field to be either a string or a list
+    # (multi-license declarations). Normalize to a single SPDX string.
+    if isinstance(raw, list):
+        spdx = (str(raw[0]).strip() if raw else "")
+    elif isinstance(raw, str):
+        spdx = raw.strip()
+    else:
+        spdx = ""
+    _HF_LICENSE_CACHE[owner_model] = spdx
+    return spdx
 
 
 def _fetch_repo_license(owner_repo: str) -> str:
@@ -1272,10 +1461,9 @@ def _paper_to_recommendation(
     abstract = (resource.get("abstract") or resource.get("summary") or "").strip()
     reasoning = (paper.get("reasoning") or "").strip()
     suggested = (paper.get("suggested_experiment") or "").strip()
-    # Best-effort code-repo extraction. Check known resource keys
-    # first (cheapest signal — these are structured data when
-    # present), then fall back to scraping abstract + reasoning + the
-    # suggested experiment for a github.com URL. First hit wins.
+    # Best-effort code + model URL extraction. Check known resource
+    # keys first (cheapest — structured data when present), then fall
+    # back to scraping the paper text. First hit wins for each kind.
     paper_github_url = ""
     for key in ("github_url", "code_url", "repo_url", "code",
                 "paperswithcode_url"):
@@ -1287,6 +1475,17 @@ def _paper_to_recommendation(
         slugs = _extract_github_urls(abstract, reasoning, suggested)
         if slugs:
             paper_github_url = f"https://github.com/{slugs[0]}"
+    paper_huggingface_url = ""
+    for key in ("hf_url", "huggingface_url", "model_card_url",
+                "huggingface_model_url"):
+        v = (resource.get(key) or "").strip()
+        if v and "huggingface.co/" in v:
+            paper_huggingface_url = v
+            break
+    if not paper_huggingface_url:
+        hf_slugs = _extract_huggingface_urls(abstract, reasoning, suggested)
+        if hf_slugs:
+            paper_huggingface_url = f"https://huggingface.co/{hf_slugs[0]}"
     return Recommendation(
         paper_title=paper.get("title") or "(untitled)",
         arxiv_id=arxiv_id,
@@ -1304,6 +1503,7 @@ def _paper_to_recommendation(
         interest_context=interest_context,
         experiment_history=experiment_history,
         paper_github_url=paper_github_url,
+        paper_huggingface_url=paper_huggingface_url,
     )
 
 
@@ -1363,6 +1563,16 @@ def _asset_to_recommendation(
     title = (asset.get("title") or "(untitled)").strip()
     abstract = (asset.get("abstract") or "").strip()
     paper_github_url = (asset.get("github_url") or "").strip()
+    paper_huggingface_url = (
+        asset.get("hf_url") or asset.get("huggingface_url")
+        or asset.get("model_card_url") or ""
+    ).strip()
+    if not paper_huggingface_url:
+        # Scrape the abstract as a fallback — the asset envelope's
+        # huggingface_url field isn't always populated.
+        hf_slugs = _extract_huggingface_urls(abstract)
+        if hf_slugs:
+            paper_huggingface_url = f"https://huggingface.co/{hf_slugs[0]}"
     # Search results carry no engine-ranked relevance — they're keyword/
     # LLM-matched against a free-text query, not the interest's profile.
     # Synthesize a score that lands in the "moderate" tier (≥ 0.60 by
@@ -1395,6 +1605,7 @@ def _asset_to_recommendation(
         interest_context=interest_context,
         experiment_history=experiment_history,
         paper_github_url=paper_github_url,
+        paper_huggingface_url=paper_huggingface_url,
     )
 
 
@@ -1749,12 +1960,102 @@ def query_remyx_candidates(target: Target) -> list[Recommendation]:
     # REMYX_LICENSE_GATE=0.
     if os.environ.get("REMYX_LICENSE_GATE", "1") != "0":
         _enrich_candidate_licenses(candidates, target)
+    # Identity-tuple dedup. Paper-version siblings (one code repo,
+    # multiple arxiv releases over time) inflate the candidate pool
+    # with what is really one engineering target. Collapse them so
+    # the selection pass doesn't waste reasoning on "which arxiv id" when
+    # the real choice is "which weights from one repo." Runs after
+    # license enrichment so the arxiv-page fallback has had its chance
+    # to populate URLs for both siblings (otherwise dedup misses when
+    # one sibling has a URL and the other doesn't).
+    candidates = _coalesce_candidate_families(candidates)
     for i, c in enumerate(candidates):
+        # Surface the identity-tuple inputs in the log so we can see at
+        # a glance which provenance won (GitHub vs HF vs none).
+        url_hint = ""
+        if c.paper_huggingface_url:
+            hf_slug = c.paper_huggingface_url.split("huggingface.co/")[-1]
+            url_hint = f" hf={hf_slug[:40]}"
+        elif c.paper_github_url:
+            gh_slug = c.paper_github_url.split("github.com/")[-1]
+            url_hint = f" gh={gh_slug[:40]}"
+        source_hint = (
+            f" [{c.license_source}]" if c.license_source else ""
+        )
         log.info(f"    [{i}] {c.paper_title[:55]}…  "
                  f"relevance={c.relevance_score:.2f}  tier={c.tier}  "
                  f"license={c.paper_license or '(none)'} "
-                 f"({c.license_class}, compat={c.license_compat:.2f})")
+                 f"({c.license_class}, compat={c.license_compat:.2f})"
+                 f"{source_hint}{url_hint}")
     return candidates
+
+
+def _coalesce_candidate_families(
+    candidates: list[Recommendation],
+) -> list[Recommendation]:
+    """Collapse paper-version siblings that share a code repo.
+
+    The unit of engineering choice is the repo + model weights, not the
+    arxiv id. Papers that share a ``github.com/<owner>/<repo>`` slug
+    represent one family of work with multiple paper releases over
+    time. Treating them as distinct candidates forces the selection
+    pass to reason about "which paper" when the real choice is "which
+    weights from one repo."
+
+    The dedup key is the GitHub slug only. HF-org-level dedup is
+    skipped — unrelated models from the same author/org would
+    false-positive (two different research lines under
+    ``huggingface.co/microsoft/*`` are not one family).
+
+    The highest-relevance candidate in each family becomes the
+    representative; its ``family_summary`` field gains a one-line
+    description of the siblings so downstream renderers can surface
+    the merged version history at a glance. Solo candidates (no shared
+    repo with any sibling) pass through unchanged.
+
+    Order-preserving for unchanged candidates so the broad-pool
+    ranking that downstream consumers depend on is not perturbed
+    except where families collapse.
+    """
+    if len(candidates) <= 1:
+        return candidates
+    # Build a mapping: github_slug → list of indices into ``candidates``
+    # that share it. Candidates with no GitHub URL skip grouping —
+    # they're never merged with anyone.
+    families: dict[str, list[int]] = {}
+    for i, c in enumerate(candidates):
+        if not c.paper_github_url:
+            continue
+        slug = _extract_github_urls(c.paper_github_url)
+        if not slug:
+            continue
+        families.setdefault(slug[0], []).append(i)
+    # Indices to drop (siblings being collapsed into their representative).
+    drop: set[int] = set()
+    for slug, idxs in families.items():
+        if len(idxs) < 2:
+            continue
+        # Representative = highest-relevance candidate in the family.
+        idxs.sort(key=lambda i: candidates[i].relevance_score, reverse=True)
+        rep_idx = idxs[0]
+        sibling_descriptors = []
+        for j in idxs[1:]:
+            sibling = candidates[j]
+            sibling_descriptors.append(
+                f"{sibling.paper_title} (arxiv {sibling.arxiv_id or 'n/a'})"
+            )
+            drop.add(j)
+        rep = candidates[rep_idx]
+        rep.family_summary = (
+            f"Coalesced from {len(idxs)} paper-version siblings under "
+            f"`github.com/{slug}` (representative: highest relevance). "
+            f"Siblings: " + "; ".join(sibling_descriptors)
+        )
+        log.info(
+            f"  family-coalesce: {slug} merges {len(idxs)} candidates → "
+            f"keeping {rep.paper_title[:40]}… (relevance {rep.relevance_score:.2f})"
+        )
+    return [c for i, c in enumerate(candidates) if i not in drop]
 
 
 def _enrich_candidate_licenses(
@@ -1762,29 +2063,76 @@ def _enrich_candidate_licenses(
 ) -> None:
     """Populate license + compat fields on each Recommendation in place.
 
-    Fetches the target repo's license once, then for each candidate with
-    a ``paper_github_url`` calls the GitHub license endpoint. Failures
-    log at debug and leave the dataclass defaults intact — the gate is
-    advisory, never blocking.
+    Resolution order per candidate:
+
+    1. If neither ``paper_github_url`` nor ``paper_huggingface_url`` is
+       set, scrape the arxiv abstract page once as a fallback (covers
+       the ~70% case where the engine envelope omits both URLs).
+    2. If a HuggingFace model URL is available, fetch the model-card
+       frontmatter license — this is the authoritative source for
+       *weight* licensing (what a customer actually loads).
+    3. Fall back to the GitHub LICENSE classifier (with the v1.3.9
+       NOASSERTION content-sniffer).
+    4. Cross-validate when both sources are present and disagree.
+    5. If no URL surfaces from any source, classify as ``"no-code-link"``
+       — distinct from ``"missing"``, which is reserved for "we *did*
+       call the LICENSE endpoint and got nothing parseable."
+
+    Best-effort throughout — any fetch failure leaves the dataclass
+    defaults intact (or the partial result it got so far). The gate is
+    advisory; it must never block the pipeline.
     """
     target_spdx = _fetch_repo_license(target.repo)
     target_class = _classify_license(target_spdx)
     log.info(f"  → license gate: target {target.repo!r} = "
              f"{target_spdx or '(none)'} ({target_class})")
     for c in candidates:
-        if not c.paper_github_url:
-            # No code link surfaced → "missing" is the right signal for
-            # a code-recommendation pipeline. Compat against missing
-            # is 0.0 by the rubric.
-            c.license_class = "missing"
-            c.license_compat = _license_compat_score("missing", target_class)
-            continue
-        slug = _extract_github_urls(c.paper_github_url)
-        if not slug:
-            continue
-        spdx = _fetch_repo_license(slug[0])
-        c.paper_license = spdx
-        c.license_class = _classify_license(spdx)
+        # Step 1: arxiv-page fallback when nothing has surfaced yet.
+        if not c.paper_github_url and not c.paper_huggingface_url:
+            gh_slugs, hf_slugs = _fetch_arxiv_abstract_page_urls(c.arxiv_id)
+            if gh_slugs:
+                c.paper_github_url = f"https://github.com/{gh_slugs[0]}"
+            if hf_slugs:
+                c.paper_huggingface_url = (
+                    f"https://huggingface.co/{hf_slugs[0]}"
+                )
+        # Step 2: HF model card (authoritative for weight licensing).
+        hf_spdx = ""
+        if c.paper_huggingface_url:
+            hf_slug = _extract_huggingface_urls(c.paper_huggingface_url)
+            if hf_slug:
+                hf_spdx = _fetch_hf_license(hf_slug[0])
+        # Step 3: GitHub LICENSE (with v1.3.9 NOASSERTION content sniff).
+        gh_spdx = ""
+        if c.paper_github_url:
+            gh_slug = _extract_github_urls(c.paper_github_url)
+            if gh_slug:
+                gh_spdx = _fetch_repo_license(gh_slug[0])
+        # Step 4: pick the most authoritative result + log mismatches.
+        if hf_spdx:
+            c.paper_license = hf_spdx
+            c.license_source = "huggingface"
+            if gh_spdx and _classify_license(gh_spdx) != _classify_license(hf_spdx):
+                log.warning(
+                    f"  license mismatch on {c.paper_title[:50]}…: "
+                    f"HF says {hf_spdx} ({_classify_license(hf_spdx)}), "
+                    f"GitHub says {gh_spdx} ({_classify_license(gh_spdx)}); "
+                    f"preferring HF (weights are the adoption target)"
+                )
+        elif gh_spdx:
+            c.paper_license = gh_spdx
+            c.license_source = (
+                "github_content_sniff" if gh_spdx not in ("NOASSERTION",)
+                and gh_spdx.lower() not in _PERMISSIVE_SPDX
+                and gh_spdx.lower() not in _COPYLEFT_SPDX
+                else "github"
+            )
+        # Step 5: bucket. "no-code-link" when we never had any URL to
+        # try; the regular classifier covers the SPDX-present cases.
+        if not c.paper_github_url and not c.paper_huggingface_url:
+            c.license_class = "no-code-link"
+        else:
+            c.license_class = _classify_license(c.paper_license)
         c.license_compat = _license_compat_score(c.license_class, target_class)
 
 
@@ -1849,24 +2197,47 @@ def _arxiv_versionless(s: str) -> str:
 def issue_for_paper(open_issues: list[dict], rec: Recommendation) -> dict | None:
     """Return an already-open Remyx Issue for this paper, if any.
 
-    Matched on the arxiv_id in the issue body — every Remyx issue links
-    ``arxiv.org/abs/<id>``, and that survives the OPEN_AS_ISSUE path where
-    the title is Claude-authored rather than ``<prefix> <paper_title>``.
-    Tries both the as-given arxiv id and its versionless form, since the
-    engine pool and broadening-search disagree on the suffix. Falls back
-    to an exact title match when the recommendation carries no arxiv_id.
+    Match order (returns the first hit):
+      1. Arxiv id (versioned and versionless variants) appearing as
+         ``arxiv.org/abs/<id>`` in the Issue body — primary key for
+         engine-pool candidates.
+      2. Sibling-paper identity: when the candidate has a code URL or
+         HF model URL, an existing Issue that references the same
+         ``github.com/<owner>/<repo>`` or ``huggingface.co/<owner>/<model>``
+         counts as "already open for this family." Catches paper-
+         version duplicates (one repo, multiple arxiv releases) where
+         each release has its own arxiv id but the engineering target
+         is one repo.
+      3. Exact title match (only used when the recommendation has no
+         arxiv id — covers the OPEN_AS_ISSUE path where the title is
+         Claude-authored).
+
     Pure (no network) so the matching is unit-testable; the fetch lives
-    in open_remyx_issues."""
-    needles: list[str] = []
+    in open_remyx_issues.
+    """
+    arxiv_needles: list[str] = []
     if rec.arxiv_id:
-        needles.append(f"arxiv.org/abs/{rec.arxiv_id}")
+        arxiv_needles.append(f"arxiv.org/abs/{rec.arxiv_id}")
         stripped = _arxiv_versionless(rec.arxiv_id)
         if stripped and stripped != rec.arxiv_id:
-            needles.append(f"arxiv.org/abs/{stripped}")
+            arxiv_needles.append(f"arxiv.org/abs/{stripped}")
+    family_needles: list[str] = []
+    if rec.paper_github_url:
+        # Normalize to the bare owner/repo slug so trailing paths / .git
+        # don't shadow the match.
+        gh_slug = _extract_github_urls(rec.paper_github_url)
+        if gh_slug:
+            family_needles.append(f"github.com/{gh_slug[0]}")
+    if rec.paper_huggingface_url:
+        hf_slug = _extract_huggingface_urls(rec.paper_huggingface_url)
+        if hf_slug:
+            family_needles.append(f"huggingface.co/{hf_slug[0]}")
     title_match = f"{PR_TITLE_PREFIX} {rec.paper_title}"
     for it in open_issues:
         body = it.get("body") or ""
-        if any(n in body for n in needles):
+        if any(n in body for n in arxiv_needles):
+            return it
+        if any(n in body for n in family_needles):
             return it
         if not rec.arxiv_id and (it.get("title") or "") == title_match:
             return it
@@ -2277,19 +2648,34 @@ def _render_candidate_brief(candidates: list[Recommendation]) -> str:
         abstract = " ".join((c.paper_abstract or "").split())
         # License gate line — surfaced to the selection pass so it can
         # weigh adoption-blocking license/code-availability signals
-        # into its choice. Omitted when no enrichment ran.
+        # into its choice. Omitted when no enrichment ran. Includes
+        # both GitHub and HuggingFace URLs when present so the selection
+        # pass sees the same provenance the gate evaluated.
         license_line = ""
-        if c.paper_github_url or c.paper_license or c.license_class != "unknown":
+        if (c.paper_github_url or c.paper_huggingface_url
+                or c.paper_license or c.license_class != "unknown"):
+            url_segs = []
+            if c.paper_github_url:
+                url_segs.append(f"gh={c.paper_github_url}")
+            if c.paper_huggingface_url:
+                url_segs.append(f"hf={c.paper_huggingface_url}")
+            urls = "  ".join(url_segs) if url_segs else "(no code/model link)"
+            source_seg = (
+                f"  source={c.license_source}" if c.license_source else ""
+            )
             license_line = (
-                f"\n    code/license: "
-                f"{c.paper_github_url or '(no code link)'}  "
+                f"\n    code/license: {urls}  "
                 f"license={c.paper_license or '(none)'} "
                 f"({c.license_class}, compat={c.license_compat:.2f})"
+                f"{source_seg}"
             )
+        family_line = (
+            f"\n    family: {c.family_summary}" if c.family_summary else ""
+        )
         blocks.append(
             f"[{i}] {c.paper_title}  "
             f"(arxiv {c.arxiv_id or 'n/a'}, relevance {c.relevance_score:.2f}, "
-            f"tier {c.tier})\n"
+            f"tier {c.tier}){family_line}\n"
             f"    why surfaced: {(c.reasoning or '(none)')[:600]}\n"
             f"    abstract: {abstract[:400]}"
             f"{license_line}"
@@ -2486,7 +2872,8 @@ def _render_license_section(rec: Recommendation) -> str:
     with a class-coded emoji and a one-line note so the maintainer
     reads it at a glance.
     """
-    if (not rec.paper_github_url and not rec.paper_license
+    if (not rec.paper_github_url and not rec.paper_huggingface_url
+            and not rec.paper_license
             and rec.license_class in ("unknown", "")
             and rec.license_compat == 0.0):
         return "\n"
@@ -2495,6 +2882,7 @@ def _render_license_section(rec: Recommendation) -> str:
         "copyleft": "🟡",
         "nc": "🔴",
         "missing": "🔴",
+        "no-code-link": "🟡",
         "unknown": "⚪",
     }.get(rec.license_class, "⚪")
     note = {
@@ -2509,21 +2897,39 @@ def _render_license_section(rec: Recommendation) -> str:
             "**No LICENSE file detected** — no legal permission to "
             "redistribute or modify the code. Treat as blocking until "
             "upstream adds a license.",
+        "no-code-link":
+            "No code repository surfaced — couldn't fetch a LICENSE to "
+            "evaluate. Worth confirming the paper has an open release "
+            "before investing in adoption.",
         "unknown":
             "Unrecognized license — manual review needed.",
     }.get(rec.license_class, "Unrecognized license class.")
-    code_line = (
-        f"- **Code**: {rec.paper_github_url}"
-        if rec.paper_github_url else
-        "- **Code**: no repository URL surfaced in the paper or "
-        "recommendation envelope."
+    # Render both code + model URLs when present so the maintainer can
+    # see what adoption surface the gate actually inspected.
+    code_lines = []
+    if rec.paper_github_url:
+        code_lines.append(f"- **Code**: {rec.paper_github_url}")
+    if rec.paper_huggingface_url:
+        code_lines.append(f"- **Model card**: {rec.paper_huggingface_url}")
+    if not code_lines:
+        code_lines.append(
+            "- **Code / model**: no repository or model URL surfaced in "
+            "the paper, recommendation envelope, or arxiv abstract page."
+        )
+    source_suffix = (
+        f", source: `{rec.license_source}`" if rec.license_source else ""
+    )
+    family_line = (
+        f"\n_{rec.family_summary}_\n" if rec.family_summary else ""
     )
     return (
         "\n## License & code availability\n\n"
         f"{emoji} {note}\n\n"
-        f"{code_line}\n"
+        + "\n".join(code_lines) + "\n"
         f"- **License**: `{rec.paper_license or '(none detected)'}` "
-        f"(class: `{rec.license_class}`, compat: {rec.license_compat:.2f})\n"
+        f"(class: `{rec.license_class}`, compat: "
+        f"{rec.license_compat:.2f}{source_suffix})\n"
+        f"{family_line}"
         "\n"
     )
 
