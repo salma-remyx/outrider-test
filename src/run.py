@@ -582,8 +582,15 @@ don't prefer it by default.
 
 If after verification the pre-fetched candidates all turn out to be
 poor structural fits, broaden the search:
-  - `remyxai search query "<technique_or_paper_name>"` — search the
-    broader Remyx catalog for papers in the same technique space
+  - `remyxai search info <arxiv_id>` — direct arxiv-id lookup; use this
+    FIRST when a maintainer thread or repo context names a specific
+    paper with an arxiv id (`arxiv NNNN.NNNNN`). The keyword search
+    endpoint occasionally misses indexed assets whose names don't
+    tokenize cleanly (CamelCase compound names, multi-word coinages),
+    so direct lookup is the authoritative path when an id is known.
+  - `remyxai search query "<technique_or_paper_name>"` — keyword search
+    of the broader Remyx catalog. Use when no arxiv id is named and
+    you're searching the technique space.
   - `remyxai papers list --interest <uuid> --limit 20 --format json`
     — pull a larger slice of the ranker's pool
 
@@ -610,7 +617,9 @@ Tools available:
   - `gh issue list/view` — see open maintainer concerns
   - `remyxai papers list/get` — inspect the ranker pool with reasoning
   - `remyxai interests get` — see the interest's project-summary context
-  - `remyxai search query` — broaden beyond the pool if needed
+  - `remyxai search info <arxiv_id>` — direct lookup of a known asset,
+    bypasses keyword-search retrieval gaps
+  - `remyxai search query` — keyword broaden beyond the pool if needed
 
 Stop iterating once you have enough evidence to pick (verified one
 candidate fits one of the three shapes) OR to reject all (every
@@ -1560,6 +1569,40 @@ def _remyx_search_assets(
         log.warning(f"    refine query {query!r} failed: {e}")
         return []
     return resp.get("assets") or []
+
+
+def _remyx_get_asset(arxiv_id: str) -> dict | None:
+    """GET ``/api/v1.0/search/assets/{arxiv_id}`` and return the asset dict.
+
+    The authoritative path when an arxiv id is known — bypasses keyword-
+    search retrieval gaps. The keyword `_remyx_search_assets` endpoint
+    occasionally misses indexed assets whose names don't tokenize
+    cleanly (CamelCase compound names, multi-word coinages);
+    direct arxiv-id lookup retrieves the asset regardless of
+    search-side retrieval quality.
+
+    Returns the asset dict on success (same envelope shape as the
+    entries `_remyx_search_assets` returns, so downstream consumers
+    don't need to switch on the source). Returns ``None`` on 404 /
+    network failure / missing asset. Never raises — selection-pass
+    broadening must not block the run.
+    """
+    arxiv_id = (arxiv_id or "").strip()
+    if not arxiv_id:
+        return None
+    try:
+        resp = _remyx_get(f"/api/v1.0/search/assets/{arxiv_id}")
+    except Exception as e:
+        log.debug(f"    asset lookup for {arxiv_id!r} failed: {e}")
+        return None
+    # The CLI's `search info` endpoint returns the asset directly at the
+    # top level (not nested under an "assets" key, unlike the keyword
+    # search which returns a list envelope). Return as-is when the
+    # response shape looks like a single asset; tolerate the alternative
+    # shape if the endpoint ever changes.
+    if isinstance(resp, dict) and (resp.get("arxiv_id") or resp.get("title")):
+        return resp
+    return None
 
 
 def _asset_to_recommendation(
