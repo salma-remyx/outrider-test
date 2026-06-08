@@ -3260,8 +3260,74 @@ def commit_and_push(
 # ─── Downgrade-to-Issue helper ─────────────────────────────────────────────
 
 
+def _capture_implementation_diff(
+    workdir: Path, max_bytes: int = 50_000,
+) -> str:
+    """Stage everything in ``workdir`` and return the diff against HEAD.
+
+    Used by downgrade paths that fire *after* the coding agent has
+    written real code — without this, the implementation is silently
+    thrown away when the orchestrator routes to Issue instead of PR.
+    The workdir is a tempdir about to be cleaned up, so the `git add`
+    side-effect doesn't bleed anywhere.
+
+    Returns ``""`` on any failure (git not on PATH, no HEAD to diff
+    against, etc.) — diff inclusion is best-effort and must never block
+    the Issue-opening path. Truncates at ``max_bytes`` with a footer
+    line indicating the truncation so the rendered Markdown is still
+    valid and the maintainer knows the patch isn't complete.
+    """
+    try:
+        subprocess.run(
+            ["git", "add", "-A"], cwd=workdir, check=True,
+            capture_output=True, timeout=30,
+        )
+        proc = subprocess.run(
+            ["git", "diff", "--staged"], cwd=workdir,
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode != 0:
+            return ""
+        diff = proc.stdout or ""
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        log.debug(f"  diff capture for {workdir} failed: {e}")
+        return ""
+    if len(diff) > max_bytes:
+        cut = diff[:max_bytes].rstrip()
+        diff = (
+            cut
+            + f"\n\n…[diff truncated at {max_bytes:,} bytes; "
+              f"original was {len(diff):,} bytes]\n"
+        )
+    return diff
+
+
+def _render_implementation_diff_section(diff: str) -> str:
+    """Wrap a captured diff in the Markdown section the Issue body uses.
+
+    Empty diff renders to ``""`` so the caller doesn't need to gate the
+    section. A ``<details>`` collapse keeps the section unobtrusive in
+    the rendered Issue but immediately expandable for review. The
+    fence is ``diff`` so GitHub colors additions / deletions natively.
+    """
+    diff = (diff or "").strip()
+    if not diff:
+        return ""
+    line_count = diff.count("\n") + 1
+    return (
+        "\n## Proposed implementation\n\n"
+        "The coding agent wrote a working draft before the downgrade "
+        "gate fired. Apply locally with `git apply` after saving the "
+        "block below.\n\n"
+        f"<details>\n<summary>Diff ({line_count} lines)</summary>\n\n"
+        f"```diff\n{diff}\n```\n\n"
+        "</details>\n\n"
+    )
+
+
 def _open_downgrade_issue(
     target: Target, rec: Recommendation, reason: str, detail: str,
+    implementation_diff: str = "",
 ) -> str:
     """Open an Issue when an automated post-implementation gate downgrades
     a PR-candidate to Issue. Used for the integration / stub-density /
@@ -3269,7 +3335,9 @@ def _open_downgrade_issue(
 
     The body explains both *why this paper is interesting* (so the team
     keeps the discovery signal) and *why we didn't open a PR* (so the
-    routing decision is auditable).
+    routing decision is auditable). When the downgrade fires *after* the
+    coding agent wrote code, callers pass ``implementation_diff`` so the
+    maintainer can review and apply the work instead of re-deriving it.
     """
     title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
     body = (
@@ -3284,6 +3352,7 @@ def _open_downgrade_issue(
         f"{_render_license_section(rec)}"
         f"## Suggested experiment\n\n"
         f"{rec.suggested_experiment or '(none)'}\n\n"
+        f"{_render_implementation_diff_section(implementation_diff)}"
         f"## Why the orchestrator opened an Issue instead of a PR\n\n"
         f"**{reason}**\n\n"
         f"{detail}\n"
@@ -3789,6 +3858,7 @@ def process_target(target: Target) -> dict:
                     "Specifics:\n\n"
                     + "\n".join(f"- {v}" for v in int_violations)
                 ),
+                implementation_diff=_capture_implementation_diff(workdir),
             )
             result["status"] = "issue_opened_no_integration"
             result["issue_url"] = issue_url
@@ -3821,6 +3891,7 @@ def process_target(target: Target) -> dict:
                     "Examples of stub bodies in the draft:\n\n"
                     + "\n".join(f"- `{e}`" for e in stub_examples)
                 ),
+                implementation_diff=_capture_implementation_diff(workdir),
             )
             result["status"] = "issue_opened_stub_density"
             result["issue_url"] = issue_url
@@ -3875,6 +3946,7 @@ def process_target(target: Target) -> dict:
                             "don't prove the integration runs against existing "
                             "pipeline outputs."
                         ),
+                        implementation_diff=_capture_implementation_diff(workdir),
                     )
                     result["status"] = "issue_opened_no_test_integration"
                     result["issue_url"] = issue_url
@@ -3905,6 +3977,7 @@ def process_target(target: Target) -> dict:
                     "trivial — stub density is judged separately.)\n\n"
                     f"_Self-review summary: {summary}_"
                 ),
+                implementation_diff=_capture_implementation_diff(workdir),
             )
             result["status"] = "issue_opened_self_review"
             result["issue_url"] = issue_url
