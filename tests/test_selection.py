@@ -118,10 +118,86 @@ def test_select_claude_failure_falls_back(tmp_path, monkeypatch):
 
 
 def test_select_unparseable_output_falls_back(tmp_path, monkeypatch):
+    """Prose on both the initial call AND the format-only retry → fall
+    through to None. Caller's job to substitute a fallback candidate."""
     geo, count = _make_candidates()
     monkeypatch.setattr(run, "_run_claude_oneshot",
                         lambda wd, p, t, **kw: (True, "I think candidate 1 is best"))
     assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
+
+
+def test_select_unparseable_initial_then_clean_retry(tmp_path, monkeypatch):
+    """The model finishes reasoning out loud on the first attempt; the
+    format-only retry then emits the JSON. Should succeed (preserving
+    the model's real pick) instead of falling through to a fallback."""
+    geo, count = _make_candidates()
+    calls = {"n": 0}
+
+    def fake_oneshot(wd, p, t, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return True, ("I now have enough evidence to decide. Let me "
+                          "consolidate the maintainer's stated preferences "
+                          "with the candidate pool ...")
+        # Second call gets the format reminder appended → returns clean JSON.
+        assert "OUTPUT FORMAT REMINDER" in p
+        return True, ('{"chosen_index": 1, "reasoning": "matches an open RFC", '
+                      '"rejected": []}')
+
+    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    sel = run.select_recommendation(tmp_path, "pkg", [geo, count])
+    assert calls["n"] == 2, "retry should have fired exactly once"
+    assert sel is not None
+    assert sel["chosen_index"] == 1
+    assert "matches an open RFC" in sel["reasoning"]
+
+
+def test_select_retry_fires_only_once(tmp_path, monkeypatch):
+    """If both the initial call AND the retry return prose, we must
+    not loop — fall through after exactly two attempts."""
+    geo, count = _make_candidates()
+    calls = {"n": 0}
+
+    def fake_oneshot(wd, p, t, **kw):
+        calls["n"] += 1
+        return True, "still just prose, no JSON here"
+
+    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
+    assert calls["n"] == 2, "should call exactly twice (initial + 1 retry)"
+
+
+def test_select_retry_skipped_when_first_call_fails(tmp_path, monkeypatch):
+    """If the initial Claude call returns ok=False (timeout / CLI gone),
+    don't waste another call on a retry — the failure isn't a parse
+    issue, it's an infra one. Fall through immediately."""
+    geo, count = _make_candidates()
+    calls = {"n": 0}
+
+    def fake_oneshot(wd, p, t, **kw):
+        calls["n"] += 1
+        return False, "claude CLI timed out"
+
+    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
+    assert calls["n"] == 1, "no retry on ok=False — that's not a parse problem"
+
+
+def test_select_retry_handles_second_call_infra_failure(tmp_path, monkeypatch):
+    """Initial parse fails → retry fires → retry's Claude call itself
+    fails (ok=False) → fall through cleanly without crashing."""
+    geo, count = _make_candidates()
+    calls = {"n": 0}
+
+    def fake_oneshot(wd, p, t, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return True, "first attempt prose, no JSON"
+        return False, "claude CLI crashed on retry"
+
+    monkeypatch.setattr(run, "_run_claude_oneshot", fake_oneshot)
+    assert run.select_recommendation(tmp_path, "pkg", [geo, count]) is None
+    assert calls["n"] == 2
 
 
 def test_pr_body_includes_selection_note_when_present():

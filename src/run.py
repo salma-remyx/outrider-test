@@ -2268,9 +2268,12 @@ def select_recommendation(
     lookback pool, given the target repo's module layout.
 
     Returns the parsed JSON ({chosen_index, reasoning, rejected}) or None
-    on any failure (single candidate, parse error, out-of-range index,
-    timeout, missing CLI). On None the caller falls back to candidates[0]
-    (the highest-ranked), preserving the pre-selection behaviour.
+    on any failure (single candidate, parse error after retry, out-of-
+    range index, timeout, missing CLI). On JSON parse failure this
+    function retries once with a format-only reminder before falling
+    through. On None, the caller falls back to the highest-relevance
+    candidate in the pool — not necessarily index 0, since the broad
+    pool isn't guaranteed to be relevance-sorted at position 0.
 
     This only chooses *which* candidate to implement — it never decides
     PR vs Issue. The chosen candidate still runs the full preflight +
@@ -2312,8 +2315,43 @@ def select_recommendation(
         return None
     data = _extract_json_object(output)
     if data is None:
-        log.warning(f"  selection: couldn't parse JSON; raw: {output[:300]!r}")
-        return None
+        # The model sometimes finishes its reasoning out loud instead of
+        # emitting the JSON contract — observed in the wild on a run that
+        # had clearly identified the right candidate but never wrote the
+        # `{"chosen_index": ...}` object. Retry once with an appended
+        # format-only reminder; the agentic context is already warm from
+        # the first attempt so a short budget is enough to format an
+        # answer. If the retry also fails, fall through to the existing
+        # fallback path.
+        log.warning(f"  selection: couldn't parse JSON; raw: {output[:300]!r}; "
+                    f"retrying with format-only reminder")
+        retry_prompt = (
+            prompt
+            + "\n\n--- OUTPUT FORMAT REMINDER ---\n"
+              "Your previous response was prose. Respond NOW with only the "
+              "JSON object specified above — no prose, no preamble, no "
+              "explanation, no markdown fences. The first character of "
+              "your response must be `{` and the last must be `}`."
+        )
+        retry_timeout = int(
+            os.environ.get("REMYX_SELECTION_RETRY_TIMEOUT_S", "90")
+        )
+        retry_max_turns = int(
+            os.environ.get("REMYX_SELECTION_RETRY_MAX_TURNS", "5")
+        )
+        ok, output = _run_claude_oneshot(
+            workdir, retry_prompt, retry_timeout, max_turns=retry_max_turns,
+        )
+        if not ok:
+            log.warning(f"  selection retry failed: {output[:200]}; "
+                        f"falling back to top-ranked candidate")
+            return None
+        data = _extract_json_object(output)
+        if data is None:
+            log.warning(f"  selection retry: still couldn't parse JSON; "
+                        f"raw: {output[:300]!r}; falling back")
+            return None
+        log.info("  selection: JSON-parse retry succeeded")
     try:
         idx = int(data.get("chosen_index"))
     except (TypeError, ValueError):
@@ -3588,9 +3626,17 @@ def process_target(target: Target) -> dict:
                     log.info(f"  ✓ issue_opened_substitution ({shape}): {issue_url}")
                     return result
             else:
-                rec = viable[0]
+                # The broad pool from `/papers/recommended` isn't guaranteed
+                # to be in descending-relevance order at index 0 — the
+                # engine occasionally seeds the list with diversity picks.
+                # Selecting `viable[0]` blindly on fallback can land the
+                # *lowest*-relevance candidate in the pool. Pick the actual
+                # highest-relevance candidate so a fallback at least gives
+                # the maintainer the engine's strongest signal.
+                rec = max(viable, key=lambda c: c.relevance_score)
                 result["selection_reasoning"] = (
-                    "(selection pass unavailable — used top-ranked candidate)"
+                    "(selection pass unavailable — used highest-relevance "
+                    "candidate as fallback)"
                 )
         result.update({
             "paper": rec.paper_title,
