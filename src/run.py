@@ -467,10 +467,27 @@ Markdown fences, no prose before or after. Schema:
   "decision": "PR" | "ISSUE",
   "reasoning": "<2-3 sentences explaining the call>",
   "issue_title": "<if ISSUE: short, action-oriented title; else empty>",
-  "issue_body": "<if ISSUE: Markdown body with sections 'Why this paper
-                  is interesting for the team', 'What blocks a clean
-                  implementation', 'What we'd need to know / decide
-                  first'; else empty>"
+  "tldr": "<if ISSUE: at-a-glance summary, max 240 chars. Cover what
+            the paper actually offers, why a clean PR didn't fit, and
+            what's worth deciding. The maintainer should be able to
+            triage from this line alone; else empty>",
+  "issue_body": "<if ISSUE: Markdown body with sections in this order
+                  and with these EXACT headings:
+                    '## Engineering analysis' (what the paper actually
+                       contributes — NOT 'Why this paper is interesting',
+                       which is rendered elsewhere by the orchestrator)
+                    '## What blocks a clean implementation'
+                    '## How to unblock this' (concrete questions and
+                       decisions the maintainer can act on — NOT
+                       'What we'd need to know')
+                  else empty>",
+  "replacement_experiment": "<if ISSUE: replacement for the paper's
+                              suggested experiment when the original is
+                              hollow or contradicts the routing decision.
+                              Empty string keeps the paper's original
+                              suggestion. Use this when you would
+                              otherwise write 'the suggested experiment
+                              is hollow' in your reasoning>"
 }
 
 --- Paper spec ---
@@ -3515,15 +3532,27 @@ def open_pr(
     return pr["html_url"]
 
 
-def open_issue(target: Target, title: str, body: str) -> str:
-    """Open a discussion Issue on the target repo. Returns the issue URL."""
-    full_body = (
-        f"{body}\n\n---\n\n"
-        f"_Opened by the [Remyx Recommendation]({CANONICAL_ATTRIBUTION_URL}) "
-        f"orchestrator — no PR was opened because the orchestrator's coding "
-        f"agent determined the paper couldn't be cleanly scaffolded against "
-        f"the current codebase._"
-    )
+def open_issue(
+    target: Target, title: str, body: str, *, footer_override: str = "",
+) -> str:
+    """Open a discussion Issue on the target repo. Returns the issue URL.
+
+    The default footer attributes the Issue to the coding agent's
+    Issue-mode election (the original use case). When the actual route
+    is different — preflight downgrade, self-review orphan, integration
+    gate, etc. — callers pass ``footer_override`` so the attribution
+    reflects the real reason. Pass an empty string to keep the default;
+    pass any other string to substitute the whole footer line.
+    """
+    if footer_override:
+        footer = footer_override
+    else:
+        footer = (
+            f"_Opened by the [Remyx Recommendation]({CANONICAL_ATTRIBUTION_URL}) "
+            f"orchestrator — the coding agent elected Issue-mode rather "
+            f"than scaffolding a PR for this paper._"
+        )
+    full_body = f"{body}\n\n---\n\n{footer}"
     log.info(f"  → opening Issue on {target.repo}")
     payload = {"title": title, "body": full_body}
     try:
@@ -3735,39 +3764,156 @@ def _render_implementation_diff_section(diff: str) -> str:
     )
 
 
+def _render_selection_note_section(selection_note: str) -> str:
+    """Render the "Why this candidate" rationale for downgrade Issues.
+
+    Parity with the PR body's selection section — gives the maintainer
+    the *why this paper from the lookback pool* answer that's currently
+    only visible in PR bodies and the step summary. Empty when the note
+    is missing or is the parenthetical fallback string (e.g. "(selection
+    pass unavailable …)") that would render as a non-explanation.
+    """
+    note = (selection_note or "").strip()
+    if not note or note.startswith("("):
+        return ""
+    return (
+        f"## Why this candidate (selected from the lookback pool)\n\n"
+        f"{note}\n\n"
+    )
+
+
+def _render_selection_rejected_section(
+    selection_rejected: list[dict] | None,
+) -> str:
+    """Render the "what else did Outrider consider" collapsed details
+    block. Mirrors the step-summary surface so a reviewer reading only
+    the Issue body can still see which alternatives were rejected and
+    why. Empty when the list is missing.
+    """
+    items = selection_rejected or []
+    if not items:
+        return ""
+    lines: list[str] = []
+    lines.append(
+        "## What else Outrider considered this run\n\n"
+        f"<details><summary>{len(items)} other candidate(s) "
+        f"considered and rejected</summary>\n"
+    )
+    for r in items[:10]:
+        arxiv = (r.get("arxiv_id") or "").strip()
+        title = (r.get("title") or "(untitled)")[:120]
+        reason = (r.get("reason") or "")[:240]
+        if arxiv:
+            lines.append(f"- [`{arxiv}`](https://arxiv.org/abs/{arxiv}) — {title}")
+        else:
+            lines.append(f"- {title}")
+        if reason:
+            lines.append(f"  - _{reason}_")
+    if len(items) > 10:
+        lines.append(f"- _…and {len(items) - 10} more_")
+    lines.append("\n</details>\n\n")
+    return "\n".join(lines)
+
+
 def _open_downgrade_issue(
     target: Target, rec: Recommendation, reason: str, detail: str,
     implementation_diff: str = "",
+    *,
+    tldr: str = "",
+    selection_note: str = "",
+    selection_rejected: list[dict] | None = None,
+    skip_paper_reasoning_section: bool = False,
+    suppress_suggested_experiment: bool = False,
+    replacement_experiment: str = "",
+    footer_override: str = "",
 ) -> str:
-    """Open an Issue when an automated post-implementation gate downgrades
-    a PR-candidate to Issue. Used for the integration / stub-density /
-    test-integration / self-review-can-delete branches in process_target.
+    """Open an Issue when an automated gate downgrades a PR-candidate.
 
-    The body explains both *why this paper is interesting* (so the team
-    keeps the discovery signal) and *why we didn't open a PR* (so the
-    routing decision is auditable). When the downgrade fires *after* the
-    coding agent wrote code, callers pass ``implementation_diff`` so the
+    Used for preflight / integration / stub-density / test-integration /
+    self-review-orphan / substitution branches in process_target. The
+    body explains why this paper is interesting (so the team keeps the
+    discovery signal) and why we didn't open a PR (so the routing
+    decision is auditable). When the downgrade fires *after* the coding
+    agent wrote code, callers pass ``implementation_diff`` so the
     maintainer can review and apply the work instead of re-deriving it.
+
+    Optional kwargs (added in v1.4.5 to tighten reviewer triage):
+
+      tldr: at-a-glance one-paragraph summary; opens the body when set
+      selection_note: "Why this candidate from the pool" rationale —
+        parity with PR-body selection section. Skips parenthetical
+        fallback strings.
+      selection_rejected: per-candidate rejection list (same shape as
+        in the step summary). Renders as a collapsed details block.
+      skip_paper_reasoning_section: when True (preflight case), skip
+        the orchestrator's own "Why this paper" section because the
+        preflight's `detail` already covers the topic in depth.
+      suppress_suggested_experiment: when True (preflight case where
+        the paper's suggested experiment was judged hollow), omit
+        the orchestrator's "Suggested experiment" section.
+      replacement_experiment: substitute for the paper's suggested
+        experiment when non-empty (and not suppressed). Used by
+        preflight to redirect the reviewer toward a viable slice.
+      footer_override: per-route attribution line. When empty the
+        default attributes to coding-agent Issue-mode election (the
+        legacy default); callers pass the routing-specific text.
     """
     title = f"{PR_TITLE_PREFIX} {rec.paper_title}"
-    body = (
+
+    sections: list[str] = []
+    sections.append(
         f"**Recommended paper**: "
         f"[{rec.paper_title}](https://arxiv.org/abs/{rec.arxiv_id})\n"
         f"**Confidence**: {rec.tier} "
         f"(Remyx relevance {rec.relevance_score:.2f})\n"
         f"**Research interest**: {rec.interest_name or '(unnamed)'}\n"
-        f"\n---\n\n"
-        f"## Why this paper is interesting for the team\n\n"
-        f"{rec.reasoning or '(no reasoning provided)'}\n"
-        f"{_render_license_section(rec)}"
-        f"## Suggested experiment\n\n"
-        f"{rec.suggested_experiment or '(none)'}\n\n"
-        f"{_render_implementation_diff_section(implementation_diff)}"
+        f"\n---\n"
+    )
+
+    if tldr.strip():
+        sections.append(f"\n## TL;DR\n\n{tldr.strip()}\n")
+
+    license_section = _render_license_section(rec)
+    if license_section.strip():
+        sections.append(license_section.rstrip() + "\n")
+
+    selection_section = _render_selection_note_section(selection_note)
+    if selection_section:
+        sections.append(selection_section)
+
+    if not skip_paper_reasoning_section:
+        sections.append(
+            f"## Why this paper is interesting for the team\n\n"
+            f"{rec.reasoning or '(no reasoning provided)'}\n"
+        )
+
+    # Suggested experiment — either the paper's original, the preflight's
+    # replacement, or omitted entirely when suppressed and no replacement
+    # was supplied. The replacement-experiment path lets preflight
+    # override hollow suggestions without contradicting itself in the
+    # body.
+    experiment_text = (replacement_experiment or "").strip()
+    if not experiment_text and not suppress_suggested_experiment:
+        experiment_text = (rec.suggested_experiment or "").strip()
+    if experiment_text:
+        sections.append(f"## Suggested experiment\n\n{experiment_text}\n")
+
+    diff_section = _render_implementation_diff_section(implementation_diff)
+    if diff_section.strip():
+        sections.append(diff_section.rstrip() + "\n")
+
+    sections.append(
         f"## Why the orchestrator opened an Issue instead of a PR\n\n"
         f"**{reason}**\n\n"
         f"{detail}\n"
     )
-    return open_issue(target, title, body)
+
+    rejected_section = _render_selection_rejected_section(selection_rejected)
+    if rejected_section:
+        sections.append(rejected_section)
+
+    body = "\n".join(s for s in sections if s)
+    return open_issue(target, title, body, footer_override=footer_override)
 
 
 # ─── Main per-target loop ──────────────────────────────────────────────────
@@ -4082,6 +4228,16 @@ def process_target(target: Target) -> dict:
                     target, rec,
                     reason=f"Selection identified an {shape_label} candidate",
                     detail=detail,
+                    selection_note=selection.get("reasoning", ""),
+                    selection_rejected=result.get("selection_rejected"),
+                    footer_override=(
+                        f"_Opened by the [Remyx Recommendation]"
+                        f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. "
+                        f"Selection identified an out-of-pool {shape_label} "
+                        f"via broadening-search; routed to Issue because "
+                        f"external picks need dependency changes that fall "
+                        f"outside the PR guardrails._"
+                    ),
                 )
                 result.update({
                     "paper": rec.paper_title,
@@ -4131,6 +4287,16 @@ def process_target(target: Target) -> dict:
                         target, rec,
                         reason=f"Selection identified a {shape_label} candidate",
                         detail=detail,
+                        selection_note=selection.get("reasoning", ""),
+                        selection_rejected=result.get("selection_rejected"),
+                        footer_override=(
+                            f"_Opened by the [Remyx Recommendation]"
+                            f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. "
+                            f"Selection identified a {shape_label} that "
+                            f"touches dependency files / module boundaries "
+                            f"outside the PR guardrails — routed to Issue "
+                            f"so the team can decide on the swap._"
+                        ),
                     )
                     result.update({
                         "paper": rec.paper_title,
@@ -4189,13 +4355,40 @@ def process_target(target: Target) -> dict:
                 or preflight.get("reasoning")
                 or ""
             )
+            # Compose the preflight detail. Promotes "Pre-flight
+            # reasoning" from a buried italicized tail into a proper
+            # heading — it's the load-bearing "why this didn't ship as
+            # a PR" answer the maintainer needs at a glance.
+            preflight_detail = (
+                f"### Why this didn't ship as a PR\n\n"
+                f"{preflight.get('reasoning', '(no reasoning provided)')}\n\n"
+                f"{issue_body_inner}"
+            )
             issue_url = _open_downgrade_issue(
                 target, rec,
                 reason="Pre-flight routed to Issue before implementation",
-                detail=(
-                    f"{issue_body_inner}\n\n"
-                    f"_Pre-flight reasoning: "
-                    f"{preflight.get('reasoning', '(none)')}_"
+                detail=preflight_detail,
+                tldr=preflight.get("tldr", ""),
+                selection_note=result.get("selection_reasoning", ""),
+                selection_rejected=result.get("selection_rejected"),
+                # Preflight's `issue_body` already covers the "what
+                # the paper offers" angle in depth; skipping the
+                # scaffolding's parallel section avoids the duplicate
+                # "Why this paper is interesting for the team" header
+                # that v1.4.4 and earlier rendered.
+                skip_paper_reasoning_section=True,
+                # The paper's suggested experiment frequently
+                # contradicts what preflight just rejected. Suppress
+                # it; preflight can supply a replacement via the new
+                # JSON field when a viable smaller slice exists.
+                suppress_suggested_experiment=True,
+                replacement_experiment=preflight.get("replacement_experiment", ""),
+                footer_override=(
+                    f"_Opened by the [Remyx Recommendation]"
+                    f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. "
+                    f"Pre-flight routed this paper to Issue before the "
+                    f"coding agent ran — see the reasoning above for "
+                    f"what would need to change to scaffold it as a PR._"
                 ),
             )
             # Override the body title with the preflight's title — it's
@@ -4269,6 +4462,16 @@ def process_target(target: Target) -> dict:
                     + "\n".join(f"- {v}" for v in int_violations)
                 ),
                 implementation_diff=_capture_implementation_diff(workdir),
+                selection_note=result.get("selection_reasoning", ""),
+                selection_rejected=result.get("selection_rejected"),
+                footer_override=(
+                    f"_Opened by the [Remyx Recommendation]"
+                    f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. The "
+                    f"coding agent wrote code but the integration gate "
+                    f"caught that it isn't wired into an existing call "
+                    f"site — routed to Issue so the team can decide on "
+                    f"the wiring._"
+                ),
             )
             result["status"] = "issue_opened_no_integration"
             result["issue_url"] = issue_url
@@ -4302,6 +4505,15 @@ def process_target(target: Target) -> dict:
                     + "\n".join(f"- `{e}`" for e in stub_examples)
                 ),
                 implementation_diff=_capture_implementation_diff(workdir),
+                selection_note=result.get("selection_reasoning", ""),
+                selection_rejected=result.get("selection_rejected"),
+                footer_override=(
+                    f"_Opened by the [Remyx Recommendation]"
+                    f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. The "
+                    f"coding agent wrote a module but most of its public "
+                    f"surface is stubs — routed to Issue rather than "
+                    f"shipping a hollow PR._"
+                ),
             )
             result["status"] = "issue_opened_stub_density"
             result["issue_url"] = issue_url
@@ -4357,6 +4569,17 @@ def process_target(target: Target) -> dict:
                             "pipeline outputs."
                         ),
                         implementation_diff=_capture_implementation_diff(workdir),
+                        selection_note=result.get("selection_reasoning", ""),
+                        selection_rejected=result.get("selection_rejected"),
+                        footer_override=(
+                            f"_Opened by the [Remyx Recommendation]"
+                            f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. "
+                            f"The coding agent's tests only self-test the "
+                            f"new module — none of them import from any "
+                            f"pre-existing module in the package, so the "
+                            f"integration is unproven. Routed to Issue."
+                            f"_"
+                        ),
                     )
                     result["status"] = "issue_opened_no_test_integration"
                     result["issue_url"] = issue_url
@@ -4375,19 +4598,36 @@ def process_target(target: Target) -> dict:
                 "production path (orphan); downgrading to Issue"
             )
             summary = review.get("honest_summary") or ""
+            # Promote the self-review summary out of italics into a
+            # proper sub-heading — it's the most informative part of
+            # the body and worth a glance, not a footnote.
+            detail_body = (
+                "On a second pass over the diff, the coding agent "
+                "concluded that no pre-existing entry point or module "
+                "invokes the new code — at most its own tests call it. "
+                "That's an orphan: the product never exercises it. "
+                "(This is about reachability, not whether the code is "
+                "trivial — stub density is judged separately.)\n"
+            )
+            if summary:
+                detail_body += (
+                    f"\n### Self-review summary\n\n{summary}\n"
+                )
             issue_url = _open_downgrade_issue(
                 target, rec,
                 reason="Self-review judged the new code an orphan (no production call path)",
-                detail=(
-                    "On a second pass over the diff, the coding agent "
-                    "concluded that no pre-existing entry point or module "
-                    "invokes the new code — at most its own tests call it. "
-                    "That's an orphan: the product never exercises it. "
-                    "(This is about reachability, not whether the code is "
-                    "trivial — stub density is judged separately.)\n\n"
-                    f"_Self-review summary: {summary}_"
-                ),
+                detail=detail_body,
                 implementation_diff=_capture_implementation_diff(workdir),
+                tldr=summary[:240] if summary else "",
+                selection_note=result.get("selection_reasoning", ""),
+                selection_rejected=result.get("selection_rejected"),
+                footer_override=(
+                    f"_Opened by the [Remyx Recommendation]"
+                    f"({CANONICAL_ATTRIBUTION_URL}) orchestrator. "
+                    f"Self-review caught that the new code is wired into "
+                    f"a flag no production caller sets — routed to Issue "
+                    f"so the team can decide whether to enable it._"
+                ),
             )
             result["status"] = "issue_opened_self_review"
             result["issue_url"] = issue_url

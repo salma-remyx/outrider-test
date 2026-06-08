@@ -157,7 +157,7 @@ def _rec():
 def test_downgrade_body_includes_diff_section_when_passed(monkeypatch):
     captured: dict = {}
 
-    def fake_open_issue(target, title, body):
+    def fake_open_issue(target, title, body, **kw):
         captured["title"] = title
         captured["body"] = body
         return "https://github.com/example/repo/issues/123"
@@ -194,7 +194,7 @@ def test_downgrade_body_omits_diff_section_when_not_passed(monkeypatch):
     pre-feature behavior."""
     captured: dict = {}
 
-    def fake_open_issue(target, title, body):
+    def fake_open_issue(target, title, body, **kw):
         captured["body"] = body
         return "https://github.com/example/repo/issues/124"
 
@@ -219,7 +219,7 @@ def test_downgrade_body_omits_diff_section_when_diff_is_empty_string(monkeypatch
     captured: dict = {}
     monkeypatch.setattr(
         run, "open_issue",
-        lambda target, title, body: captured.update({"body": body}) or "url",
+        lambda target, title, body, **kw: captured.update({"body": body}) or "url",
     )
 
     run._open_downgrade_issue(
