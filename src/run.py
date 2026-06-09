@@ -524,8 +524,8 @@ iteratively. For your most promising candidate(s):
     extends (`gh issue list --repo <repo> --state open --search "..."`
     or `gh issue view <n> --repo <repo>` for specific Issues).
 
-**Three legitimate integration shapes — classify each candidate you
-consider.** A candidate that does NOT fit one of these three shapes is
+**Four legitimate integration shapes — classify each candidate you
+consider.** A candidate that does NOT fit one of these four shapes is
 a structural mismatch and should be rejected.
 
   - **addition** — paper adds a NEW module that is called from EXISTING
@@ -547,6 +547,36 @@ a structural mismatch and should be rejected.
     confirm the merged contribution spans those boundaries cleanly;
     estimate migration cost.
 
+  - **extension** — paper proposes a NEW capability the repo currently
+    lacks but that fits as a natural extension of the existing pipeline
+    shape AND the team has signaled openness to it. STRICTER bar than
+    addition (no existing call site to anchor against). ALL FOUR gates
+    must pass for a candidate to be classified as extension:
+      1. **Pipeline-compatible I/O contract** — the new capability fits
+         the repo's existing pipeline shape (e.g. for a data-pipeline
+         repo, "dataset in, dataset out" is extension-compatible; a
+         stage that requires a fundamentally new data shape is not).
+      2. **Stated team-direction signal in the repo** — at least one
+         explicit signal that the team is open to this capability:
+         a README "future directions" / "roadmap" section naming the
+         domain; an open Issue with title `[RFC]` / `[Proposal]` or
+         labeled `rfc` / `discussion` whose body names this paper or
+         a similar technique; a CONTEXT.md bullet showing recent
+         investment in adjacent capabilities; the interest description
+         itself naming the broader domain. Without ≥1 explicit signal,
+         this is RFC-fishing, not extension — REJECT.
+      3. **No existing implementation in the repo** — `gh code-search`
+         confirms no existing module implements the candidate's
+         contribution. If a partial implementation exists, this is
+         addition or replacement, not extension.
+      4. **Higher relevance + interest-alignment bar than addition** —
+         tier MUST be `high` AND relevance MUST be ≥ 0.90 AND the
+         `reasoning` field MUST verbalize the interest-alignment.
+    Verification: cite the specific team-direction signal that satisfies
+    gate 2 in the `team_direction_signal` schema field below. Cite the
+    adjacent pipeline stage (upstream or downstream of the proposed new
+    stage) in `proposed_call_site`.
+
 Replacement and simplification need a STRICTER bar than addition: the
 I/O contracts must align functionally, not just thematically. A paper
 that "could replace" an existing component but whose actual inputs or
@@ -558,10 +588,12 @@ though both invoke "Stein's method" — the I/O contracts are different
 problem classes.
 
 **Tie-break — when implementability is comparable, prefer
-simplification > replacement > addition.** A paper that lets the
-maintainer simplify, accelerate, or replace an existing stage tends
-to produce deeper engagement than a paper that adds a parallel
-feature, all else equal. Reasons:
+simplification > replacement > addition > extension.** A paper that
+lets the maintainer simplify, accelerate, or replace an existing stage
+tends to produce deeper engagement than a paper that adds a parallel
+feature, all else equal. Extension is LAST-RESORT — picked only when
+all three other shapes fail AND all four extension gates pass.
+Reasons:
 
   - The repo's existing contracts are already in production. A
     proposal anchored on one of those contracts carries leverage that
@@ -573,6 +605,11 @@ feature, all else equal. Reasons:
     that preserve value even when not adopted as PRs.
   - Net-new add-alongside picks correlate with PRs that go stale or
     get rejected because the repo's actual call sites don't need them.
+  - Extension picks have NO call site at all — they propose adding
+    one. Without explicit team-direction signal, an extension pick is
+    indistinguishable from RFC-fishing. The four gates exist to filter
+    legitimate extensions (where the team has invited the capability)
+    from speculation.
 
 When two candidates score similarly on the verification bar, favor
 the one that touches more existing call sites — even if its surface
@@ -597,10 +634,11 @@ poor structural fits, broaden the search:
 When the broader catalog surfaces a candidate that satisfies one of the
 three integration shapes — especially when a maintainer thread (an open
 Issue, an active PR discussion) names a specific paper that the pool
-doesn't contain AND the paper is not already in the "Already filed by
-Outrider" section above — you MAY return it as an **out-of-pool pick**
-using the extended schema below (`chosen_index: -2`). Papers in the
-discharged set have already been put in front of the maintainer and
+doesn't contain AND the paper is not already in the "Already in the
+team's attention" section above — you MAY return it as an
+**out-of-pool pick** using the extended schema below (`chosen_index:
+-2`). Papers in the discharge set have already been put in front of
+the maintainer (either by Outrider or by a maintainer-opened RFC) and
 must not be re-picked here, in-pool or out — selecting one wastes the
 selection-pass budget and the dedup gate would skip it anyway.
 
@@ -641,7 +679,9 @@ fences, no prose before or after. Schema:
   "chosen_call_site": "<the specific path:function you verified the
                         paper plugs into for `addition`, or the existing
                         component(s) being replaced for `replacement` /
-                        `simplification`; omit when chosen_index = -1>",
+                        `simplification`; omit when chosen_index = -1
+                        or when integration_shape = `extension` (use
+                        `proposed_call_site` instead)>",
   "external_arxiv_id": "<arxiv_id of the out-of-pool paper; REQUIRED
                          when chosen_index = -2, omit otherwise>",
   "external_title": "<title of the out-of-pool paper from the search
@@ -650,7 +690,22 @@ fences, no prose before or after. Schema:
                            actually ran to surface it; REQUIRED when
                            chosen_index = -2>",
   "integration_shape": "addition" | "replacement" | "simplification"
+                       | "extension"
                        (omit when chosen_index = -1),
+  "team_direction_signal": "<REQUIRED when integration_shape =
+                             `extension`, omit otherwise: the specific
+                             repo signal that satisfies extension gate
+                             2 — e.g. 'Issue #NN (open, labeled rfc)
+                             names this paper directly' or
+                             'README \"Future directions\" section names
+                             this domain' or 'CONTEXT.md shipping
+                             bullets show 4 recent commits in adjacent
+                             stage'>",
+  "proposed_call_site": "<REQUIRED when integration_shape = `extension`,
+                          omit otherwise: the adjacent existing pipeline
+                          stage (upstream or downstream of the proposed
+                          new stage) — e.g. 'after pkg.module.stage_a,
+                          before publish — same dataset I/O shape'>",
   "contract_match": "<one line — REQUIRED for replacement /
                       simplification AND for any chosen_index = -2:
                       how the existing component's I/O contract and the
@@ -2278,6 +2333,71 @@ def _all_remyx_issues(target: Target) -> list[dict]:
     return _remyx_issues(target, state="all")
 
 
+def _arxiv_linked_issues(target: Target, state: str = "all") -> list[dict]:
+    """All Issues on the target repo whose body links an arxiv paper,
+    regardless of who opened them.
+
+    Maintainer-opened RFCs, community-opened Issues, and Outrider Issues
+    all qualify — the arxiv-in-body match is the discharge signal. A
+    maintainer who opens an RFC linking arxiv 2605.26004 has signaled
+    exactly as strongly as Outrider would have by opening its own
+    Issue: the paper is already in the team's attention.
+
+    Returns Issues sorted as GitHub returned them (most-recently-updated
+    first by default). PRs are excluded. The "Outrider-prefixed"
+    filter from ``_remyx_issues`` does NOT apply here — that's the
+    whole point.
+    """
+    try:
+        issues = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues?state={state}&per_page=100",
+        ) or []
+    except Exception as e:
+        log.debug(
+            f"  fetch arxiv-linked issues (state={state}) for "
+            f"{target.repo} failed: {e}"
+        )
+        return []
+    out = []
+    for it in issues:
+        if it.get("pull_request"):
+            continue
+        body = it.get("body") or ""
+        if _arxiv_id_from_issue_body(body):
+            out.append(it)
+    return out
+
+
+def _all_discharge_issues(target: Target) -> list[dict]:
+    """Merged discharge set: Outrider Issues + maintainer arxiv-linked
+    Issues. The dedup gate's input.
+
+    De-duplicated by Issue number so an Outrider Issue that happens to
+    also link arxiv (which it always does) isn't double-counted. Order
+    preserved as GitHub returned: most-recently-updated first.
+
+    Each entry is annotated in-place with a ``_remyx_source`` key set
+    to either ``"outrider"`` (matches the Outrider-prefix filter) or
+    ``"maintainer"`` (passed only the arxiv-link filter). Downstream
+    rendering uses this for the ``[Outrider]`` / ``[Maintainer]`` tag
+    in the selection prompt's discharge section.
+    """
+    outrider_issues = _all_remyx_issues(target)
+    outrider_numbers = {it.get("number") for it in outrider_issues if it.get("number") is not None}
+    for it in outrider_issues:
+        it["_remyx_source"] = "outrider"
+    arxiv_issues = _arxiv_linked_issues(target)
+    merged = list(outrider_issues)
+    for it in arxiv_issues:
+        num = it.get("number")
+        if num is None or num in outrider_numbers:
+            continue
+        it["_remyx_source"] = "maintainer"
+        merged.append(it)
+    return merged
+
+
 def _arxiv_versionless(s: str) -> str:
     """Drop a trailing ``v<digits>`` from an arxiv id.
 
@@ -2756,11 +2876,17 @@ def _arxiv_id_from_issue_body(body: str) -> str | None:
 
 
 def _discharged_index(issues: list[dict]) -> dict[str, dict]:
-    """Build an arxiv-id -> {issue_number, state, title} index from the
-    all-state prior-Outrider-Issues set. Used by both the discharge-set
-    prompt section and the in-pool candidate annotation. Keyed on the
+    """Build an arxiv-id -> {number, state, title, source} index from the
+    all-state discharge set. Used by both the discharge-set prompt
+    section and the in-pool candidate annotation. Keyed on the
     versionless arxiv id so a candidate at 2605.26102v3 matches an Issue
     that linked 2605.26102v1.
+
+    ``source`` is ``"outrider"`` or ``"maintainer"``, taken from the
+    ``_remyx_source`` annotation set by ``_all_discharge_issues``. Falls
+    back to ``"outrider"`` when unset (the v1.4.7/v1.4.8 path didn't
+    carry source info, so callers that pass in only Outrider Issues get
+    sensible defaults).
     """
     out: dict[str, dict] = {}
     for it in issues:
@@ -2777,6 +2903,7 @@ def _discharged_index(issues: list[dict]) -> dict[str, dict]:
             "number": it.get("number"),
             "state": it.get("state") or "open",
             "title": it.get("title") or "",
+            "source": it.get("_remyx_source") or "outrider",
         }
     return out
 
@@ -2809,12 +2936,17 @@ def _render_discharged_papers(issues: list[dict], cap: int = 50) -> str:
         title = (it.get("title") or "").strip()
         # Strip the standard "[Remyx Recommendation] " prefix for
         # readability — the section header already carries that context.
+        # Doesn't apply to maintainer-opened Issues (different titles),
+        # but the strip is no-op on those.
         if title.startswith(PR_TITLE_PREFIX + " "):
             title = title[len(PR_TITLE_PREFIX) + 1:]
         if len(title) > 80:
             title = title[:77] + "…"
+        source = it.get("_remyx_source") or "outrider"
+        source_tag = "[Outrider]" if source == "outrider" else "[Maintainer]"
         bullets.append(
-            f"- arxiv {arxiv} — \"{title}\" — Issue #{number} ({state})"
+            f"- arxiv {arxiv} — \"{title}\" — Issue #{number} ({state}) "
+            f"{source_tag}"
         )
     if not bullets:
         return ""
@@ -2824,16 +2956,19 @@ def _render_discharged_papers(issues: list[dict], cap: int = 50) -> str:
         if skipped else ""
     )
     return (
-        "--- Already filed by Outrider for this repository "
-        "(do NOT re-pick) ---\n"
+        "--- Already in the team's attention (do NOT re-pick) ---\n"
         "\n"
-        "These papers have an existing Outrider Issue — open means still in\n"
-        "flight, closed means the team has made a call. Either way the\n"
-        "maintainer has already been told. Selecting one of these (in-pool\n"
-        "or out-of-pool) would just re-confirm what's already on record.\n"
-        "Skip them. If you believe one should be revisited, the lever is\n"
-        "for the maintainer to reopen the Issue — not for selection to\n"
-        "re-pick.\n"
+        "These papers have an existing Issue referencing the arxiv id on\n"
+        "this repository. Outrider-opened Issues are marked [Outrider];\n"
+        "maintainer-opened Issues (RFCs, discussions) are marked\n"
+        "[Maintainer]. Either way the paper is already in front of the\n"
+        "team — selecting one (in-pool or out-of-pool) would just\n"
+        "re-confirm what's already on record. Skip them.\n"
+        "\n"
+        "A [Maintainer]-tagged paper is a STRONGER stay-away signal than\n"
+        "[Outrider]: the maintainer themselves filed the discussion. If\n"
+        "you believe one should be revisited, the lever is for the\n"
+        "maintainer to reopen the Issue — not for selection to re-pick.\n"
         "\n"
         + "\n".join(bullets)
         + footer
@@ -2886,17 +3021,19 @@ def _render_candidate_brief(
             f"\n    family: {c.family_summary}" if c.family_summary else ""
         )
         # Discharge annotation. When the candidate's arxiv id matches a
-        # prior Outrider Issue, surface the Issue # and state inline so
-        # the LLM sees the dedup signal next to the candidate it's
-        # weighing — not just in the section above.
+        # prior Issue (Outrider-opened or maintainer-opened), surface
+        # the Issue # + state + source inline so the LLM sees the dedup
+        # signal next to the candidate it's weighing.
         discharged_suffix = ""
         if c.arxiv_id:
             versionless = _arxiv_versionless(c.arxiv_id) or c.arxiv_id
             entry = discharged.get(versionless) or discharged.get(c.arxiv_id)
             if entry:
+                src = entry.get("source") or "outrider"
+                src_tag = "[Outrider]" if src == "outrider" else "[Maintainer]"
                 discharged_suffix = (
                     f"  ✗ already filed: Issue #{entry['number']} "
-                    f"({entry['state']}) — do NOT pick"
+                    f"({entry['state']}) {src_tag} — do NOT pick"
                 )
         blocks.append(
             f"[{i}] {c.paper_title}  "
@@ -3018,6 +3155,43 @@ def select_recommendation(
         log.warning(f"  selection: chosen_index not an int "
                     f"({data.get('chosen_index')!r}); falling back")
         return None
+    # Extension-shape picks need extra schema fields beyond
+    # the base contract: team_direction_signal + proposed_call_site.
+    # Without them, the pick fails the four-gate verification we
+    # documented to the model; treat as malformed.
+    shape = (data.get("integration_shape") or "").lower().strip()
+    if shape == "extension":
+        tds = (data.get("team_direction_signal") or "").strip()
+        pcs = (data.get("proposed_call_site") or "").strip()
+        if not tds or not pcs:
+            log.warning(
+                f"  selection: integration_shape='extension' but missing "
+                f"required fields (team_direction_signal={tds!r}, "
+                f"proposed_call_site={pcs!r}); falling back to skip-by-"
+                f"verification"
+            )
+            data["chosen_index"] = -1
+            return data
+        # Extension floor: tier=high AND relevance >= 0.90 (gate 4 of the
+        # four-gate verification). Only validate when chosen_index >= 0;
+        # external extension picks (-2) don't have a pool candidate to
+        # check against.
+        if idx >= 0 and 0 <= idx < len(candidates):
+            cand = candidates[idx]
+            if cand.tier.lower() != "high" or cand.relevance_score < 0.90:
+                log.warning(
+                    f"  selection: extension pick [{idx}] "
+                    f"{cand.paper_title[:50]}… fails extension floor "
+                    f"(tier={cand.tier!r}, relevance={cand.relevance_score:.2f}); "
+                    f"extension requires tier=high AND relevance>=0.90; "
+                    f"falling back to skip-by-verification"
+                )
+                data["chosen_index"] = -1
+                return data
+        log.info(
+            f"  selection: extension pick — direction signal: {tds[:100]!r}, "
+            f"adjacent call site: {pcs[:80]!r}"
+        )
     # Agentic selection may surface an out-of-pool candidate via
     # broadening-search (chosen_index: -2). Validate the required
     # external_* fields are present; if they're missing, the agent
@@ -4299,7 +4473,13 @@ def process_target(target: Target) -> dict:
     #    "don't check out the repo if nothing is actionable"
     #    optimization the single-pick flow had.
     min_required = TIER_RANK.get(target.min_confidence.lower(), 2)
-    open_issues = _all_remyx_issues(target)
+    # `open_issues` is misnamed historically — it now carries the full
+    # discharge set: Outrider-opened Issues (any state) PLUS maintainer-
+    # opened Issues that reference an arxiv id in their body. The
+    # broader invariant is "a paper has been put in front of the team;
+    # don't waste budget re-deriving it" regardless of who opened the
+    # Issue.
+    open_issues = _all_discharge_issues(target)
     viable: list[Recommendation] = []
     dropped_low_conf = 0
     dropped_pr_exists = 0
@@ -4444,24 +4624,63 @@ def process_target(target: Target) -> dict:
                     "addition":       "out-of-pool addition",
                     "replacement":    "out-of-pool drop-in replacement",
                     "simplification": "out-of-pool pipeline simplification",
+                    "extension":      "out-of-pool extension (new capability)",
                 }.get(shape, "out-of-pool substitution")
+                # Extension-shape picks thread the new schema fields
+                # into the result so the downgrade Issue body and step
+                # summary can surface them. REQUIRED for shape=extension;
+                # absent on other shapes by design.
+                if shape == "extension":
+                    result["selection_team_direction_signal"] = (
+                        selection.get("team_direction_signal", "")
+                    )
+                    result["selection_proposed_call_site"] = (
+                        selection.get("proposed_call_site", "")
+                    )
                 contract_match = selection.get("contract_match", "")
                 migration_cost = selection.get("migration_cost", "")
-                detail = (
-                    f"**Integration shape**: {shape_label}\n\n"
-                    f"**Contract match**: {contract_match or '(none reported)'}\n\n"
-                    f"**Migration cost**: {migration_cost or '(none reported)'}\n\n"
-                    f"_Selection reasoning_: {selection.get('reasoning', '')}\n\n"
-                    f"This candidate was surfaced via `remyxai search query "
-                    f"{selection.get('external_query_used', '')!r}` — it is NOT "
-                    f"in the engine's recommendation pool for this interest. "
-                    f"The selection pass identified it via broadening-search "
-                    f"after verifying that no in-pool candidate cleanly fits "
-                    f"the contract the maintainer thread or search context "
-                    f"pointed at. Opening as an Issue (rather than a draft PR) "
-                    f"because external picks need dependency changes that "
-                    f"fall outside the PR guardrails."
-                )
+                if shape == "extension":
+                    # Extension picks use different schema fields. Render
+                    # the team_direction_signal and proposed_call_site
+                    # instead of contract_match / migration_cost (which
+                    # don't apply when there's no existing call site).
+                    tds = selection.get("team_direction_signal", "")
+                    pcs = selection.get("proposed_call_site", "")
+                    detail = (
+                        f"**Integration shape**: {shape_label}\n\n"
+                        f"**Team-direction signal**: "
+                        f"{tds or '(none reported)'}\n\n"
+                        f"**Proposed adjacent call site**: "
+                        f"{pcs or '(none reported)'}\n\n"
+                        f"_Selection reasoning_: "
+                        f"{selection.get('reasoning', '')}\n\n"
+                        f"This candidate proposes a NEW capability the "
+                        f"repository does not currently have. The selection "
+                        f"pass verified that the team has signaled openness "
+                        f"to this capability via the direction signal "
+                        f"above (an RFC, a README roadmap item, or a "
+                        f"CONTEXT.md investment pattern). Opening as an "
+                        f"Issue rather than a PR because there is no "
+                        f"existing call site to integrate against — this "
+                        f"is a proposal for the maintainer to weigh, not a "
+                        f"drop-in implementation."
+                    )
+                else:
+                    detail = (
+                        f"**Integration shape**: {shape_label}\n\n"
+                        f"**Contract match**: {contract_match or '(none reported)'}\n\n"
+                        f"**Migration cost**: {migration_cost or '(none reported)'}\n\n"
+                        f"_Selection reasoning_: {selection.get('reasoning', '')}\n\n"
+                        f"This candidate was surfaced via `remyxai search query "
+                        f"{selection.get('external_query_used', '')!r}` — it is NOT "
+                        f"in the engine's recommendation pool for this interest. "
+                        f"The selection pass identified it via broadening-search "
+                        f"after verifying that no in-pool candidate cleanly fits "
+                        f"the contract the maintainer thread or search context "
+                        f"pointed at. Opening as an Issue (rather than a draft PR) "
+                        f"because external picks need dependency changes that "
+                        f"fall outside the PR guardrails."
+                    )
                 issue_url = _open_downgrade_issue(
                     target, rec,
                     reason=f"Selection identified an {shape_label} candidate",

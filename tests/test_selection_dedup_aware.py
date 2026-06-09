@@ -124,13 +124,17 @@ def test_render_discharged_includes_header_and_bullets():
                title="Paper Gamma"),
     ]
     out = run._render_discharged_papers(issues)
-    assert "Already filed by Outrider" in out
+    # New header copy in v1.5.0 (was "Already filed by Outrider")
+    assert "Already in the team's attention" in out
     assert "do NOT re-pick" in out
     # Both bullets present with arxiv + Issue # + state
     assert "arxiv 2605.26102" in out
     assert "Issue #88 (closed)" in out
     assert "arxiv 2607.07321" in out
     assert "Issue #94 (open)" in out
+    # Source tag — defaults to [Outrider] when _remyx_source isn't set
+    # (v1.4.8 callers).
+    assert "[Outrider]" in out
     # Re-engagement lever is documented inside the section
     assert "reopen the issue" in out.lower()
 
@@ -237,7 +241,9 @@ def test_selection_prompt_body_mentions_discharged_rule():
     the template wraps at ~70 cols."""
     prompt = run._SELECTION_PROMPT_TEMPLATE
     unwrapped = " ".join(prompt.split())
-    assert "Already filed by Outrider" in unwrapped
+    # v1.5.0: section header renamed from "Already filed by Outrider"
+    # to "Already in the team's attention"
+    assert "Already in the team's attention" in unwrapped
     assert "must not be re-picked" in unwrapped
     # The placeholder for the section itself is present (un-wrapped).
     assert "__DISCHARGED_PAPERS__" in prompt
@@ -263,7 +269,10 @@ def test_selection_prompt_renders_byte_stable_when_no_issues(monkeypatch, tmp_pa
         discharged_issues=[],
     )
     prompt = captured_prompts[0]
-    assert "Already filed by Outrider for this repository" not in prompt
+    # No discharge section content when there are no prior Issues —
+    # neither header variant should leak.
+    assert "Already in the team's attention" not in prompt
+    assert "Already filed by Outrider" not in prompt
     assert "already filed: Issue" not in prompt
     # Placeholder must be substituted — should never leak into the
     # rendered prompt.
@@ -296,8 +305,8 @@ def test_selection_prompt_renders_discharge_section_when_issues_present(
         ],
     )
     prompt = captured_prompts[0]
-    # Standalone section
-    assert "Already filed by Outrider for this repository" in prompt
+    # Standalone section — v1.5.0 changed the header
+    assert "Already in the team's attention" in prompt
     assert "Issue #88 (closed)" in prompt
     # In-pool inline annotation
     assert "already filed: Issue #88 (closed)" in prompt
