@@ -6650,6 +6650,8 @@ def _compose_weekly_markdown(
     agg: dict,
     open_items: list[dict],
     drafted: dict | None,
+    lifecycle_events: list[dict] | None = None,
+    newly_viable: list[dict] | None = None,
 ) -> str:
     """Assemble the Discussion-comment body.
 
@@ -6712,6 +6714,17 @@ def _compose_weekly_markdown(
     if trends:
         lines += ["", "### 📈 In the research stream", ""]
         lines += [f"- {t}" for t in trends]
+
+    # Lifecycle events on Outrider Issues/PRs in the past 7 days
+    # (REMYX-114). Section omitted entirely when no events occurred.
+    if lifecycle_events:
+        lines += _render_lifecycle_events_section(lifecycle_events, window_end)
+
+    # Newly-viable recommendations — previously blocked at the license
+    # gate, now resolve to a permissive license. Sibling category to
+    # lifecycle events above; same omit-when-empty shape.
+    if newly_viable:
+        lines += _render_newly_viable_section(newly_viable)
 
     if open_items:
         next_actions = drafted.get("next_actions")
@@ -6798,6 +6811,547 @@ def _compose_weekly_markdown(
     return "\n".join(lines)
 
 
+# ─── Lifecycle events for Outrider-authored artifacts (REMYX-114) ─────────
+
+
+def _is_bot_actor(user: dict | None) -> bool:
+    """True if a GitHub API ``user`` dict belongs to a bot account.
+
+    Filters our own follow-ups out of "lifecycle events" the weekly
+    summary surfaces — comments by ``remyx-ai[bot]`` or
+    ``github-actions[bot]`` aren't new signal for the maintainer.
+    """
+    if not user:
+        return True
+    if (user.get("type") or "").lower() == "bot":
+        return True
+    login = (user.get("login") or "").lower()
+    return login in {"remyx-ai[bot]", "github-actions[bot]", "app/remyx-ai"}
+
+
+def _is_outrider_artifact(item: dict) -> bool:
+    """True if a GitHub Issue/PR was opened by Outrider.
+
+    Matches both historical artifacts (``[Remyx Recommendation]`` title
+    prefix) and new-format artifacts (body marker from the orchestrator-
+    built PR body footer).
+    """
+    title = item.get("title") or ""
+    body = item.get("body") or ""
+    head_ref = (((item.get("pull_request") or {}).get("head") or {}).get("ref")
+                if item.get("pull_request") else None)
+    head_ref = head_ref or ((item.get("head") or {}).get("ref") if item.get("head") else "")
+    return (
+        title.startswith(PR_TITLE_PREFIX)
+        or "Remyx Recommendation" in body
+        or (head_ref and head_ref.startswith(BRANCH_PREFIX))
+    )
+
+
+def _parse_iso(s: str) -> "dt.datetime | None":
+    """Parse a GitHub ISO-8601 timestamp; return None on failure."""
+    if not s:
+        return None
+    try:
+        # GitHub returns 2026-06-12T15:30:00Z; Python's fromisoformat
+        # handles the Z suffix from 3.11+ but we replace for safety.
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _relative_when(when: "dt.datetime", now: "dt.datetime") -> str:
+    """Format a recent past timestamp as 'today' / 'yesterday' / 'N days ago'.
+
+    Caps at 7 days since that's the weekly window — anything older would
+    be a bug (or a freshly-discovered event in a stale artifact).
+    """
+    delta = now - when
+    days = delta.days
+    if days < 0:
+        return "just now"
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "yesterday"
+    return f"{days} days ago"
+
+
+def _lifecycle_events_for_outrider_artifacts(
+    target: Target, window_start: "dt.datetime", window_end: "dt.datetime",
+    max_events: int = 10,
+) -> list[dict]:
+    """Detect state-change events on Outrider-authored Issues/PRs in the window.
+
+    Single-pass over the target repo's recently-updated issues+PRs (the
+    REST ``issues`` endpoint returns both with ``pull_request`` set on
+    PRs), filtered to Outrider-authored. For each, emit events that
+    occurred in ``[window_start, window_end]``:
+
+    - Issue/PR closed or reopened
+    - PR merged (state=closed AND merged_at within window)
+    - New comments from non-bot actors
+    - PR reviews from non-bot actors
+
+    Returns events sorted by recency (newest first), capped at
+    ``max_events`` so the digest doesn't balloon. Terminal events
+    (merged/closed) are prioritized over intermediate ones when the cap
+    is reached.
+    """
+    since_iso = window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        items = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues"
+            f"?state=all&since={since_iso}&per_page=100",
+        ) or []
+    except Exception as e:
+        log.debug(f"  lifecycle events fetch for {target.repo} failed: {e}")
+        return []
+
+    events: list[dict] = []
+    for item in items:
+        if not _is_outrider_artifact(item):
+            continue
+
+        number = item.get("number")
+        title = item.get("title") or ""
+        html_url = item.get("html_url") or ""
+        is_pr = item.get("pull_request") is not None
+        kind_prefix = "PR" if is_pr else "Issue"
+
+        # Terminal state events
+        if item.get("state") == "closed":
+            closed_at = _parse_iso(item.get("closed_at") or "")
+            if closed_at and window_start <= closed_at <= window_end:
+                # PR merged is a distinct, higher-signal terminal event
+                merged_at_str = (item.get("pull_request") or {}).get("merged_at")
+                merged_at = _parse_iso(merged_at_str) if merged_at_str else None
+                if merged_at and window_start <= merged_at <= window_end:
+                    events.append({
+                        "number": number, "title": title, "url": html_url,
+                        "kind_prefix": kind_prefix, "kind": "merged",
+                        "when": merged_at, "actor": "maintainer",
+                        "priority": 0,  # terminal events go first
+                    })
+                else:
+                    closed_by = (item.get("closed_by") or {}).get("login") or "maintainer"
+                    events.append({
+                        "number": number, "title": title, "url": html_url,
+                        "kind_prefix": kind_prefix, "kind": "closed",
+                        "when": closed_at, "actor": closed_by,
+                        "priority": 0,
+                    })
+
+        # Recently-opened Outrider artifacts also count as activity
+        # (the maintainer wants to see "Outrider opened #N this week").
+        created_at = _parse_iso(item.get("created_at") or "")
+        if created_at and window_start <= created_at <= window_end:
+            events.append({
+                "number": number, "title": title, "url": html_url,
+                "kind_prefix": kind_prefix, "kind": "opened",
+                "when": created_at, "actor": "Outrider",
+                "priority": 2,  # informational
+            })
+
+        # Comments from non-bot actors in the window
+        try:
+            comments = gh_api(
+                "GET",
+                f"/repos/{target.repo}/issues/{number}/comments"
+                f"?since={since_iso}&per_page=50",
+            ) or []
+        except Exception:
+            comments = []
+        for c in comments:
+            user = c.get("user") or {}
+            if _is_bot_actor(user):
+                continue
+            when = _parse_iso(c.get("created_at") or "")
+            if not when or when < window_start or when > window_end:
+                continue
+            body = (c.get("body") or "").strip()
+            # First non-empty line as a one-glance summary
+            summary_line = next(
+                (ln.strip() for ln in body.splitlines() if ln.strip()), ""
+            )
+            events.append({
+                "number": number, "title": title, "url": html_url,
+                "kind_prefix": kind_prefix, "kind": "comment",
+                "when": when, "actor": user.get("login") or "?",
+                "summary": summary_line[:120],
+                "priority": 1,
+            })
+
+    # Sort by (priority asc, when desc) — terminal events first within
+    # each artifact, then newest events overall.
+    events.sort(key=lambda e: (e.get("priority", 9), -(e["when"].timestamp())))
+    return events[:max_events]
+
+
+def _render_lifecycle_events_section(
+    events: list[dict], now: "dt.datetime",
+) -> list[str]:
+    """Render the Outrider-artifact lifecycle events as markdown lines.
+
+    Returns ``[]`` when no events were detected — caller skips the
+    section header entirely (no "nothing happened" noise per the
+    REMYX-114 acceptance criteria).
+    """
+    if not events:
+        return []
+    lines: list[str] = [
+        "",
+        "### 🔁 Recent activity on Outrider Issues/PRs",
+        "",
+    ]
+    for e in events:
+        when_label = _relative_when(e["when"], now)
+        actor = e.get("actor") or "?"
+        kind = e.get("kind")
+        prefix = e.get("kind_prefix") or "Item"
+        number = e.get("number")
+        url = e.get("url")
+        short_title = _short_artifact_title(e.get("title") or "")[:80]
+        head = f"- [{prefix} #{number}]({url}) ({short_title})"
+        if kind == "merged":
+            lines.append(f"{head} — merged {when_label}")
+        elif kind == "closed":
+            lines.append(f"{head} — closed by @{actor} {when_label}")
+        elif kind == "opened":
+            lines.append(f"{head} — opened by Outrider {when_label}")
+        elif kind == "comment":
+            summary = (e.get("summary") or "").rstrip(":") or "(no summary)"
+            lines.append(
+                f"{head} — comment by @{actor} {when_label}: {summary}"
+            )
+        else:
+            lines.append(f"{head} — {kind} {when_label}")
+    return lines
+
+
+# ─── License-watch: previously-blocked candidates becoming viable ─────────
+
+
+# Regex for the license line that ``_render_license_section`` always
+# writes into an Outrider Issue/PR body:
+#   - **License**: `<spdx>` (class: `<class>`, compat: <compat>[, source: `<src>`])
+_LICENSE_BODY_LINE_RE = re.compile(
+    r"\*\*License\*\*:\s*`(?P<spdx>[^`]*)`"
+    r"\s*\(class:\s*`(?P<klass>[^`]+)`,"
+    r"\s*compat:\s*(?P<compat>[0-9.]+)"
+    r"(?:,\s*source:\s*`(?P<source>[^`]+)`)?\)",
+    re.IGNORECASE,
+)
+
+# Regex for the code-URL line(s). Outrider writes either
+#   - **Code**: <github url>
+# or
+#   - **Model card**: <hf url>
+# (or both). When neither is found the body has a "no repository" note.
+_CODE_BODY_LINE_RE = re.compile(
+    r"\*\*Code\*\*:\s*(?P<url>https?://github\.com/\S+)",
+    re.IGNORECASE,
+)
+_MODEL_BODY_LINE_RE = re.compile(
+    r"\*\*Model card\*\*:\s*(?P<url>https?://huggingface\.co/\S+)",
+    re.IGNORECASE,
+)
+
+
+def _parse_license_state_from_issue_body(body: str) -> dict | None:
+    """Extract the license-at-recommendation snapshot from an Issue body.
+
+    Returns a dict with ``spdx``, ``klass``, ``compat`` (float),
+    ``code_url`` / ``model_url`` (optional), and ``source`` (optional).
+
+    Two paths:
+
+    - **Structured**: matches the License line that ``_render_license_section``
+      writes ("**License**: ``<spdx>`` (class: ``<klass>``, compat: <c>...)").
+      This is the normal path for current-format Outrider Issues.
+    - **Body-scan fallback**: when the structured line is absent (older
+      Issue formats from before license enrichment was always-on), scan
+      the body for any GitHub or HuggingFace URLs and synthesize a
+      "no-enrichment" snapshot with ``klass="no-enrichment"`` and
+      ``compat=0.30`` (treated as blocked, same severity as
+      ``no-code-link``). The license-watch can then re-check the
+      upstream URL and surface the Issue if the current state is
+      permissive.
+
+    Returns ``None`` only when neither path yields anything usable.
+    """
+    if not body:
+        return None
+    m = _LICENSE_BODY_LINE_RE.search(body)
+    if m:
+        try:
+            compat = float(m.group("compat"))
+        except (TypeError, ValueError):
+            return None
+        snap: dict = {
+            "spdx": (m.group("spdx") or "").strip(),
+            "klass": (m.group("klass") or "").strip(),
+            "compat": compat,
+            "source": m.group("source"),
+        }
+        code = _CODE_BODY_LINE_RE.search(body)
+        if code:
+            snap["code_url"] = code.group("url").rstrip(".,")
+        model = _MODEL_BODY_LINE_RE.search(body)
+        if model:
+            snap["model_url"] = model.group("url").rstrip(".,")
+        return snap
+
+    # Fallback: no structured License section, but the body may still
+    # reference a code URL the agent linked elsewhere (e.g. older Issue
+    # bodies opened before license enrichment was always-on, or agent-
+    # written Issue bodies that linked the repo from a free-form section).
+    # ``_extract_github_urls`` / ``_extract_huggingface_urls`` return
+    # ``owner/repo`` slugs; prepend the host so downstream consumers
+    # (``_recheck_outrider_license_state``) get the full URL shape they
+    # expect.
+    github_slugs = [
+        s for s in _extract_github_urls(body)
+        # Skip Remyx's own URLs — these appear in the orchestrator
+        # footer / call-to-action lines, not the paper's reference repo.
+        if not s.lower().startswith(("remyxai/", "smellslikeml/"))
+    ]
+    hf_slugs = _extract_huggingface_urls(body)
+    if not github_slugs and not hf_slugs:
+        return None
+    snap = {
+        "spdx": "",
+        "klass": "no-enrichment",
+        "compat": 0.30,
+        "source": "body-scan",
+    }
+    if github_slugs:
+        snap["code_url"] = f"https://github.com/{github_slugs[0]}"
+    if hf_slugs:
+        snap["model_url"] = f"https://huggingface.co/{hf_slugs[0]}"
+    return snap
+
+
+def _recheck_outrider_license_state(snap: dict) -> dict | None:
+    """Re-fetch license status for a recommendation given its snapshot.
+
+    ``snap`` is the output of ``_parse_license_state_from_issue_body``.
+    Re-resolves the upstream LICENSE via the existing helpers and
+    returns a parallel dict with the *current* spdx/klass/compat.
+    Returns ``None`` when no code URL is known and no fresh URL can be
+    discovered (nothing to check).
+    """
+    code_url = snap.get("code_url")
+    model_url = snap.get("model_url")
+
+    fresh: dict = {"spdx": "", "klass": "missing", "compat": 0.0, "source": ""}
+    if code_url:
+        owner_repo = code_url.split("github.com/", 1)[-1].rstrip("/")
+        owner_repo = "/".join(owner_repo.split("/")[:2])
+        try:
+            spdx = _fetch_repo_license(owner_repo)
+        except Exception:
+            spdx = ""
+        fresh["spdx"] = (spdx or "").strip()
+        fresh["klass"] = _classify_license(fresh["spdx"])
+        fresh["source"] = "github"
+    if model_url and (not code_url or fresh["klass"] in ("missing", "unknown")):
+        owner_model = model_url.split("huggingface.co/", 1)[-1].rstrip("/")
+        try:
+            spdx = _fetch_hf_license(owner_model)
+        except Exception:
+            spdx = ""
+        if spdx:
+            fresh["spdx"] = spdx.strip()
+            fresh["klass"] = _classify_license(fresh["spdx"])
+            fresh["source"] = "hf"
+    if not code_url and not model_url:
+        # The previous snapshot was "no code link found." Nothing to
+        # re-check until the agent re-discovers a URL — out of scope
+        # for the in-band watch.
+        return None
+    # Score against permissive target (the conservative default; the
+    # interest's actual target class isn't easily reachable here).
+    fresh["compat"] = _license_compat_score(fresh["klass"], "permissive")
+    return fresh
+
+
+def _is_license_newly_viable(prev: dict, curr: dict) -> bool:
+    """True if the recommendation transitioned from blocked to viable.
+
+    "Blocked" = compat < 0.50 (no-code-link, missing, or nc) at the
+    recommendation snapshot. "Viable" = compat >= 1.00 at the re-check
+    (permissive only — copyleft into a permissive target stays a
+    yellow flag, not a green one, and shouldn't fire as "newly viable").
+    """
+    return prev["compat"] < 0.5 <= 1.0 <= curr["compat"]
+
+
+def _arxiv_id_from_outrider_body(body: str) -> str:
+    """Extract the arxiv id from an Outrider Issue/PR body.
+
+    The body always links the paper as ``https://arxiv.org/abs/<id>``
+    near the top (set by the PR/Issue templates). Returns "" when no
+    arxiv link is found.
+    """
+    if not body:
+        return ""
+    m = re.search(r"https?://arxiv\.org/abs/([\w./-]+)", body)
+    return (m.group(1) if m else "").rstrip(").,")
+
+
+def _discover_code_url_from_comments(
+    target: Target, issue_number: int,
+) -> str | None:
+    """Scan an Outrider Issue's comments for a code URL the agent didn't
+    surface in the body.
+
+    Maintainer-written discussion often names the upstream code repo
+    even when the original recommendation came through as ``no-code-link``
+    (e.g. a licensing-audit comment that enumerates the upstream
+    repo's missing LICENSE). Returns the first non-Remyx GitHub URL
+    found, or ``None``.
+
+    Best-effort: any API failure returns ``None`` so the caller
+    proceeds without the comment-discovered URL.
+    """
+    if not issue_number:
+        return None
+    try:
+        comments = gh_api(
+            "GET",
+            f"/repos/{target.repo}/issues/{issue_number}/comments?per_page=50",
+        ) or []
+    except Exception:
+        return None
+    for c in comments:
+        body = c.get("body") or ""
+        slugs = [
+            s for s in _extract_github_urls(body)
+            if not s.lower().startswith(("remyxai/", "smellslikeml/"))
+        ]
+        if slugs:
+            return f"https://github.com/{slugs[0]}"
+    return None
+
+
+def _newly_viable_outrider_artifacts(
+    target: Target, max_items: int = 5,
+) -> list[dict]:
+    """Iterate open Outrider Issues; surface ones whose license transitioned
+    from blocked to viable since recommendation time.
+
+    Lookup order for each Issue:
+
+    1. Parse the structured License line from the body (current-format
+       Outrider Issues written by ``_render_license_section``).
+    2. Fallback: scan the body for any GitHub/HF URLs (older-format
+       Issues where the URL appears outside a structured section).
+    3. Fallback: scan the Issue's comments for a GitHub URL maintainers
+       referenced after recommendation time (e.g. licensing-audit
+       comments that name the upstream repo).
+
+    Returns a list of dicts: ``number``, ``title``, ``url``,
+    ``arxiv_id``, ``prev`` snapshot, ``curr`` snapshot — capped at
+    ``max_items`` so the digest doesn't balloon if many recommendations
+    were unblocked in the same week.
+    """
+    try:
+        items = _remyx_issues(target, state="open") or []
+    except Exception as e:
+        log.debug(f"  newly-viable fetch for {target.repo} failed: {e}")
+        return []
+
+    out: list[dict] = []
+    for item in items:
+        body = item.get("body") or ""
+        prev = _parse_license_state_from_issue_body(body)
+        # Comment-scan fallback: when the body parse fails OR when the
+        # parsed snapshot has no code URL to re-check against (e.g.
+        # a no-code-link snapshot), look in the comments for one.
+        if (prev is None
+                or (not prev.get("code_url") and not prev.get("model_url"))):
+            discovered = _discover_code_url_from_comments(
+                target, item.get("number"),
+            )
+            if discovered:
+                if prev is None:
+                    prev = {
+                        "spdx": "", "klass": "no-enrichment",
+                        "compat": 0.30, "source": "comments-scan",
+                    }
+                else:
+                    prev["source"] = (
+                        f"{prev.get('source') or 'body'}+comments-scan"
+                    )
+                prev["code_url"] = discovered
+
+        if not prev:
+            continue
+        # Only re-check Issues that were blocked at recommendation time.
+        if prev["compat"] >= 1.0:
+            continue
+        try:
+            curr = _recheck_outrider_license_state(prev)
+        except Exception as e:
+            log.debug(
+                f"  recheck failed for issue #{item.get('number')}: {e}"
+            )
+            continue
+        if not curr:
+            continue
+        if not _is_license_newly_viable(prev, curr):
+            continue
+        out.append({
+            "number": item.get("number"),
+            "title": item.get("title") or "",
+            "url": item.get("html_url") or "",
+            "arxiv_id": _arxiv_id_from_outrider_body(body),
+            "prev": prev,
+            "curr": curr,
+        })
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _render_newly_viable_section(transitions: list[dict]) -> list[str]:
+    """Render the "Newly viable recommendations" markdown lines.
+
+    Returns ``[]`` when no transitions — caller skips the section header
+    entirely (same shape as the lifecycle-events renderer).
+    """
+    if not transitions:
+        return []
+    lines: list[str] = [
+        "",
+        "### 🟢 Newly viable recommendations",
+        "",
+        "Recommendations previously blocked at the license/code-availability "
+        "gate now resolve to a permissive license. Worth reconsidering:",
+        "",
+    ]
+    for t in transitions:
+        prev = t["prev"]
+        curr = t["curr"]
+        prev_label = (
+            f"`{prev['spdx']}`" if prev["spdx"]
+            else "no declared license"
+        )
+        prev_klass = prev["klass"]
+        curr_spdx = curr["spdx"] or "(detected)"
+        lines.append(
+            f"- [Issue #{t['number']}]({t['url']}) "
+            f"{_short_artifact_title(t['title'])[:80]} — "
+            f"upstream now publishes `{curr_spdx}` "
+            f"(was: {prev_label}, class `{prev_klass}`, compat "
+            f"{prev['compat']:.2f}). Re-run selection to confirm "
+            f"structural fit, then decide whether to draft a PR."
+        )
+    return lines
+
+
 def run_weekly_summary(target: Target) -> dict:
     """Aggregate the past week's runs and post the digest to the
     configured Discussion. The weekly-mode counterpart to
@@ -6824,12 +7378,26 @@ def run_weekly_summary(target: Target) -> dict:
         key=lambda it: it.get("created_at") or "",
         reverse=True,
     )
+    # Lifecycle events on Outrider-authored Issues/PRs in the window —
+    # state transitions + maintainer comments since the prior digest
+    # (REMYX-114). Empty list when nothing changed; the render code
+    # then omits the section header entirely.
+    lifecycle_events = _lifecycle_events_for_outrider_artifacts(
+        target, window_start, window_end,
+    )
+    # License-watch: re-check upstream license for open Outrider Issues
+    # that were originally blocked at the license/code-availability gate;
+    # surface ones that transitioned to viable (REMYX-115). Sibling
+    # category to the lifecycle events above — shares the same surface.
+    newly_viable = _newly_viable_outrider_artifacts(target)
     agg = _aggregate_week(entries)
     agg["repo"] = target.repo
     prior_digest = _fetch_prior_digest_excerpt(discussion_id)
     drafted = _draft_weekly_narrative(agg, open_items, prior_digest)
     body = _compose_weekly_markdown(
         window_start, window_end, agg, open_items, drafted,
+        lifecycle_events=lifecycle_events,
+        newly_viable=newly_viable,
     )
     url = _post_discussion_comment(discussion_id, body)
     result.update({
